@@ -108,17 +108,6 @@ RUN pip install --no-cache-dir spconv-cu120
 # ── xformers (optional, fallback attention backend) ──────────────────────────
 RUN pip install --no-cache-dir xformers==0.0.29.post3
 
-# ── Verify critical imports (skip nvdiffrast: needs GPU driver at runtime) ──
-RUN python -c "\
-import torch; \
-import cumesh; \
-import flex_gemm; \
-import o_voxel; \
-import xformers; \
-import spconv; \
-print('OK — torch', torch.__version__, '| CUDA', torch.version.cuda)" \
- && pip show nvdiffrast | head -2
-
 # ── Cleanup build artifacts ──────────────────────────────────────────────────
 RUN rm -rf /tmp/extensions
 
