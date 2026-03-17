@@ -23,7 +23,9 @@ ENV http_proxy=${http_proxy} \
     no_proxy=${no_proxy} \
     NO_PROXY=${no_proxy}
 
-ENV DEBIAN_FRONTEND=noninteractive \
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    NVIDIA_VISIBLE_DEVICES=all \
+    DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     CUDA_HOME=/usr/local/cuda-12.8 \
@@ -108,15 +110,17 @@ RUN pip install --no-cache-dir --force-reinstall \
     --index-url https://download.pytorch.org/whl/cu128
 
 # ── Step 13: Verify all critical imports ─────────────────────────────────────
+# Note: nvdiffrast import triggers driver detection which fails without GPU at
+# build time. We only verify the package is installed; runtime uses CudaContext.
 RUN python -c "\
 import torch; \
 import cumesh; \
 import flex_gemm; \
 import o_voxel; \
-import nvdiffrast; \
 import xformers; \
 import spconv; \
-print('All imports OK — torch', torch.__version__, '| CUDA', torch.version.cuda)"
+print('All imports OK — torch', torch.__version__, '| CUDA', torch.version.cuda)" \
+ && pip show nvdiffrast > /dev/null 2>&1 && echo 'nvdiffrast: installed'
 
 # ── Application source ──────────────────────────────────────────────────────
 COPY trellis2/          /app/trellis2/
