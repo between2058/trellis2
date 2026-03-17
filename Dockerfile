@@ -12,8 +12,8 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ARG TORCH_CUDA_ARCH_LIST="12.0"
 ARG MAX_JOBS=4
-ARG http_proxy=""
-ARG https_proxy=""
+ARG http_proxy="http://proxy.intra:80"
+ARG https_proxy="http://proxy.intra:80"
 ARG no_proxy="localhost,127.0.0.1"
 
 ENV http_proxy=${http_proxy} \
