@@ -34,7 +34,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_CACHE=/app/hf_cache \
     HUGGINGFACE_HUB_CACHE=/app/hf_cache
 
-# System packages
+# ── System packages ──────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 python3.10-dev python3-pip \
     build-essential ninja-build cmake git wget curl \
@@ -50,61 +50,82 @@ RUN test -d /usr/local/cuda-12.8 || ln -sf /usr/local/cuda /usr/local/cuda-12.8
 
 WORKDIR /app
 
-# Step 1: PyTorch
+# ── Step 1: PyTorch ──────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir \
     torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
     --index-url https://download.pytorch.org/whl/cu128
 
-# Step 2: Python deps
+# ── Step 2: Python deps ─────────────────────────────────────────────────────
 COPY requirements-api.txt .
 RUN pip install --no-cache-dir -r requirements-api.txt
 
-# Step 3: xformers
+# ── Step 3: xformers ────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir xformers==0.0.31
 
-# Step 4: spconv
+# ── Step 4: spconv ──────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir spconv-cu120
 
-# Step 5: CUDA extensions (require PyTorch + CUDA to compile)
-# nvdiffrast
+# ── Step 5: nvdiffrast ──────────────────────────────────────────────────────
 RUN mkdir -p /tmp/extensions \
  && git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast \
  && pip install --no-cache-dir --no-build-isolation /tmp/extensions/nvdiffrast
 
-# Step 7: nvdiffrec (split-sum PBR renderer)
+# ── Step 6: nvdiffrec (split-sum PBR renderer) ──────────────────────────────
 RUN git clone -b renderutils https://github.com/JeffreyXiang/nvdiffrec.git /tmp/extensions/nvdiffrec \
  && pip install --no-cache-dir --no-build-isolation /tmp/extensions/nvdiffrec
 
-# Step 8: CuMesh (CUDA mesh utilities)
+# ── Step 7: CuMesh (CUDA mesh utilities) ────────────────────────────────────
 RUN git clone --recursive https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh \
  && pip install --no-cache-dir --no-build-isolation /tmp/extensions/CuMesh
 
-# Step 9: FlexGEMM (sparse convolution)
+# ── Step 8: FlexGEMM (sparse convolution via Triton) ────────────────────────
 RUN git clone --recursive https://github.com/JeffreyXiang/FlexGEMM.git /tmp/extensions/FlexGEMM \
  && pip install --no-cache-dir --no-build-isolation /tmp/extensions/FlexGEMM
 
-# Step 10: flash-attn
+# ── Step 9: o-voxel (voxel representation) ──────────────────────────────────
+# o-voxel lives in-repo but depends on an eigen git submodule that may not be
+# populated on the server. COPY the source, then fetch eigen if missing.
+COPY o-voxel/ /tmp/extensions/o-voxel/
+RUN if [ ! -f /tmp/extensions/o-voxel/third_party/eigen/Eigen/Dense ]; then \
+        rm -rf /tmp/extensions/o-voxel/third_party/eigen \
+        && git clone --depth 1 https://gitlab.com/libeigen/eigen.git \
+               /tmp/extensions/o-voxel/third_party/eigen ; \
+    fi \
+ && pip install --no-cache-dir --no-build-isolation /tmp/extensions/o-voxel
+
+# ── Step 10: flash-attn ─────────────────────────────────────────────────────
 RUN MAX_JOBS=4 pip install --no-cache-dir --no-build-isolation \
     flash-attn==2.8.0.post2
 
-# Step 11: misc deps from setup.sh
+# ── Step 11: misc deps from setup.sh ────────────────────────────────────────
 RUN pip install --no-cache-dir \
     git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8 \
     kornia pillow-simd
 
-# Step 12: Re-lock PyTorch (prevent downgrades from transitive deps)
+# ── Step 12: Re-lock PyTorch (prevent downgrades from transitive deps) ──────
 RUN pip install --no-cache-dir --force-reinstall \
     torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
     --index-url https://download.pytorch.org/whl/cu128
 
-# Application source
-COPY o-voxel/           /tmp/extensions/o-voxel/
-RUN pip install --no-cache-dir --no-build-isolation /tmp/extensions/o-voxel
+# ── Step 13: Verify all critical imports ─────────────────────────────────────
+RUN python -c "\
+import torch; \
+import cumesh; \
+import flex_gemm; \
+import o_voxel; \
+import nvdiffrast; \
+import xformers; \
+import spconv; \
+print('All imports OK — torch', torch.__version__, '| CUDA', torch.version.cuda)"
 
+# ── Application source ──────────────────────────────────────────────────────
 COPY trellis2/          /app/trellis2/
 COPY trellis2_api.py    /app/trellis2_api.py
 
 RUN mkdir -p /app/logs /app/outputs
+
+# Cleanup build artifacts
+RUN rm -rf /tmp/extensions
 
 EXPOSE 52070
 
