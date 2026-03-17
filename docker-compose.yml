@@ -32,6 +32,7 @@ services:
       - HF_HOME=/app/hf_cache
       - TRANSFORMERS_CACHE=/app/hf_cache
       - HUGGINGFACE_HUB_CACHE=/app/hf_cache
+      - HF_TOKEN=${HF_TOKEN:-}
 
     deploy:
       resources:
