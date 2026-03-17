@@ -406,3 +406,75 @@ class Trellis2TexturingPipeline(Pipeline):
         pbr_voxel = self.decode_tex_slat(tex_slat)
         out_mesh = self.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)
         return out_mesh
+
+    @torch.no_grad()
+    def run_multiview(
+        self,
+        mesh: 'trimesh.Trimesh',
+        front_image: Image.Image,
+        back_image: Optional[Image.Image] = None,
+        left_image: Optional[Image.Image] = None,
+        right_image: Optional[Image.Image] = None,
+        seed: int = 42,
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        resolution: int = 1024,
+        texture_size: int = 2048,
+        front_axis: str = 'z',
+        blend_temperature: float = 2.0,
+    ) -> 'trimesh.Trimesh':
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        views_dict = {'front': front_image}
+        if back_image is not None: views_dict['back'] = back_image
+        if left_image is not None: views_dict['left'] = left_image
+        if right_image is not None: views_dict['right'] = right_image
+        views_list = list(views_dict.keys())
+
+        if preprocess_image:
+            views_dict = {k: self.preprocess_image(v) for k, v in views_dict.items()}
+
+        mesh = self.preprocess_mesh(mesh)
+        cond_res = 512 if resolution == 512 else 1024
+
+        conds = {}
+        for v, img in views_dict.items():
+            conds[v] = self.get_cond([img], cond_res)
+
+        shape_slat = self.encode_shape_slat(mesh, resolution)
+
+        # Multi-view tex slat sampling
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(shape_slat.device)
+        shape_slat_normalized = (shape_slat - mean) / std
+
+        flow_model = self.models[f'tex_slat_flow_model_{cond_res}']
+        in_channels = flow_model.in_channels
+        noise = shape_slat.replace(
+            feats=torch.randn(shape_slat.coords.shape[0], in_channels - shape_slat.feats.shape[1]).to(self.device)
+        )
+
+        from .samplers import FlowEulerMultiViewGuidanceIntervalSampler
+        sampler = FlowEulerMultiViewGuidanceIntervalSampler(
+            sigma_min=self.tex_slat_sampler.sigma_min,
+            resolution=flow_model.resolution,
+        )
+        sampler_params = {**self.tex_slat_sampler_params, **tex_slat_sampler_params}
+
+        slat = sampler.sample(
+            flow_model, noise, conds=conds, views=views_list,
+            front_axis=front_axis, blend_temperature=blend_temperature,
+            concat_cond=shape_slat_normalized,
+            **sampler_params, verbose=True, tqdm_desc="Sampling texture SLat (MultiView)",
+        ).samples
+
+        std_t = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
+        mean_t = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)
+        slat = slat * std_t + mean_t
+
+        pbr_voxel = self.decode_tex_slat(slat)
+        torch.cuda.empty_cache()
+        return self.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)

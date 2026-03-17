@@ -187,6 +187,63 @@ Then, you can access the demo at the address shown in the terminal.
 Please refer to the [example_texturing.py](example_texturing.py) for an example of how to generate PBR textures for a given 3D shape. Also, you can use the [app_texturing.py](app_texturing.py) to run a web demo for PBR texture generation.
 
 
+## 🌐 API Service
+
+TRELLIS.2 can be served as a FastAPI service for production use.
+
+### Quick Start (Docker)
+
+```bash
+cp .env.example .env    # Edit with your HF_CACHE_PATH, GPU_ID, etc.
+docker compose up -d --build
+```
+
+The API will be available at `http://localhost:52070`.
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/generate` | POST | Single image → 3D mesh (GLB) |
+| `/generate-multiview` | POST | Multi-view images → 3D mesh (GLB) |
+| `/texture` | POST | Mesh + image → textured mesh |
+| `/texture-multiview` | POST | Mesh + multi-view images → textured mesh |
+| `/mesh-process` | POST | Mesh processing (simplify, remesh, fill holes, smooth) |
+| `/download/{id}/{file}` | GET | Download generated assets |
+
+### Multi-View Generation
+
+Generate higher quality 3D models by providing multiple view images (front, back, left, right). Each voxel's prediction is spatially blended across views using softmax weighting.
+
+```bash
+curl -X POST http://localhost:52070/generate-multiview \
+  -F "front=@front.png" \
+  -F "back=@back.png" \
+  -F "sampler=rk4" \
+  -F "blend_temperature=2.0"
+```
+
+### Advanced Samplers
+
+Three ODE solvers are available for generation:
+
+| Sampler | Order | Quality | Speed |
+|---------|-------|---------|-------|
+| `euler` | 1st | Good | Fastest |
+| `heun` | 2nd | Better | Medium |
+| `rk4` | 4th | Best | Slowest |
+
+### Without Docker
+
+```bash
+pip install -r requirements-api.txt
+SPCONV_ALGO=native python -m uvicorn trellis2_api:app --host 0.0.0.0 --port 52070
+```
+
+For detailed API reference, see [docs/API.md](docs/API.md). For deployment guide, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+
 ## 🏋️ Training
 
 We provide the full training codebase, enabling users to train **TRELLIS.2** from scratch or fine-tune it on custom datasets.

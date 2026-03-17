@@ -1,0 +1,45 @@
+version: "3.8"
+
+# =============================================================================
+# TRELLIS.2 API — Docker Compose
+#
+# Quick start:
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+# =============================================================================
+
+services:
+  trellis2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_CUDA_ARCH_LIST: "12.0"
+        MAX_JOBS: "4"
+
+    image: trellis2-api:latest
+    container_name: trellis2-api
+
+    ports:
+      - "${API_PORT:-52070}:52070"
+
+    volumes:
+      - ${HF_CACHE_PATH}:/app/hf_cache:rw
+      - ./logs:/app/logs
+
+    environment:
+      - SPCONV_ALGO=native
+      - HF_HOME=/app/hf_cache
+      - TRANSFORMERS_CACHE=/app/hf_cache
+      - HUGGINGFACE_HUB_CACHE=/app/hf_cache
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_ID}"]
+              capabilities: [gpu]
+
+    shm_size: "8gb"
+    restart: unless-stopped

@@ -1,4 +1,6 @@
 from typing import *
+import gc
+import random
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,6 +10,13 @@ from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
+
+
+def seed_all(seed: int = 0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 class Trellis2ImageTo3DPipeline(Pipeline):
@@ -77,6 +86,28 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             'alpha': slice(5, 6),
         }
         self._device = 'cpu'
+        self._sampler_prefix = 'Euler'
+
+    def switch_samplers(self, sampler_type: str = "euler"):
+        """Dynamically switch sampler instances based on type."""
+        prefix = {"rk4": "RK4", "heun": "Heun"}.get(sampler_type, "Euler")
+        self._sampler_prefix = prefix
+        args = self._pretrained_args
+        self.sparse_structure_sampler = getattr(samplers, f"Flow{prefix}GuidanceIntervalSampler")(**args['sparse_structure_sampler']['args'])
+        self.shape_slat_sampler = getattr(samplers, f"Flow{prefix}GuidanceIntervalSampler")(**args['shape_slat_sampler']['args'])
+        self.tex_slat_sampler = getattr(samplers, f"Flow{prefix}GuidanceIntervalSampler")(**args['tex_slat_sampler']['args'])
+
+    def _cond_to(self, cond: dict, device: torch.device) -> dict:
+        return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cond.items()}
+
+    def _cond_cpu(self, cond: dict) -> dict:
+        return {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in cond.items()}
+
+    def _cleanup_cuda(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     @classmethod
     def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Trellis2ImageTo3DPipeline":
@@ -593,3 +624,241 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return out_mesh, (shape_slat, tex_slat, res)
         else:
             return out_mesh
+
+    # =========================================================================
+    # Multi-View Methods
+    # =========================================================================
+
+    def sample_sparse_structure_multiview(
+        self, conds: dict, views: list, resolution: int,
+        num_samples: int = 1, sampler_params: dict = {},
+        front_axis: str = 'z', blend_temperature: float = 2.0,
+    ) -> torch.Tensor:
+        if self.low_vram:
+            for v in conds:
+                conds[v] = self._cond_to(conds[v], self.device)
+        flow_model = self.models['sparse_structure_flow_model']
+        reso = flow_model.resolution
+        noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(self.device)
+
+        sampler_class = getattr(
+            samplers, f"Flow{self._sampler_prefix}MultiViewGuidanceIntervalSampler",
+            samplers.FlowEulerMultiViewGuidanceIntervalSampler,
+        )
+        sampler = sampler_class(sigma_min=self.sparse_structure_sampler.sigma_min, resolution=reso)
+        sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
+
+        if self.low_vram:
+            flow_model.to(self.device)
+        z_s = sampler.sample(
+            flow_model, noise, conds=conds, views=views,
+            front_axis=front_axis, blend_temperature=blend_temperature,
+            **sampler_params, verbose=True, tqdm_desc="Sampling sparse structure (MultiView)",
+        ).samples
+        if self.low_vram:
+            flow_model.cpu()
+            self._cleanup_cuda()
+
+        decoder = self.models['sparse_structure_decoder']
+        if self.low_vram:
+            decoder.to(self.device)
+        decoded = decoder(z_s) > 0
+        if self.low_vram:
+            decoder.cpu()
+            self._cleanup_cuda()
+
+        if resolution != decoded.shape[2]:
+            if resolution < decoded.shape[2]:
+                ratio = decoded.shape[2] // resolution
+                decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
+            else:
+                decoded = torch.nn.functional.interpolate(decoded.float(), size=(resolution,)*3, mode='nearest') > 0.5
+
+        coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+        if self.low_vram:
+            for v in conds:
+                conds[v] = self._cond_cpu(conds[v])
+            self._cleanup_cuda()
+        return coords
+
+    def sample_shape_slat_multiview(
+        self, conds: dict, views: list, flow_model,
+        coords: torch.Tensor, sampler_params: dict = {},
+        front_axis: str = 'z', blend_temperature: float = 2.0,
+    ) -> SparseTensor:
+        if self.low_vram:
+            for v in conds:
+                conds[v] = self._cond_to(conds[v], self.device)
+        coords_dev = coords.to(self.device)
+        noise = SparseTensor(
+            feats=torch.randn(coords.shape[0], flow_model.in_channels, device=self.device),
+            coords=coords_dev,
+        )
+        sampler_class = getattr(
+            samplers, f"Flow{self._sampler_prefix}MultiViewGuidanceIntervalSampler",
+            samplers.FlowEulerMultiViewGuidanceIntervalSampler,
+        )
+        sampler = sampler_class(sigma_min=self.shape_slat_sampler.sigma_min, resolution=flow_model.resolution)
+        sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
+
+        if self.low_vram:
+            flow_model.to(self.device)
+        slat = sampler.sample(
+            flow_model, noise, conds=conds, views=views,
+            front_axis=front_axis, blend_temperature=blend_temperature,
+            **sampler_params, verbose=True, tqdm_desc="Sampling shape SLat (MultiView)",
+        ).samples
+        if self.low_vram:
+            flow_model.cpu()
+            self._cleanup_cuda()
+
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
+        slat = slat * std + mean
+        if self.low_vram:
+            for v in conds:
+                conds[v] = self._cond_cpu(conds[v])
+            self._cleanup_cuda()
+        return slat
+
+    def sample_tex_slat_multiview(
+        self, conds: dict, views: list, shape_slat: SparseTensor,
+        flow_model, sampler_params: dict = {},
+        front_axis: str = 'z', blend_temperature: float = 2.0,
+    ) -> SparseTensor:
+        if self.low_vram:
+            for v in conds:
+                conds[v] = self._cond_to(conds[v], self.device)
+
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(shape_slat.device)
+        shape_slat_normalized = (shape_slat - mean) / std
+
+        in_channels = flow_model.in_channels if isinstance(flow_model, nn.Module) else flow_model[0].in_channels
+        noise = shape_slat.replace(
+            feats=torch.randn(shape_slat.coords.shape[0], in_channels - shape_slat.feats.shape[1]).to(self.device)
+        )
+        sampler_params = {**self.tex_slat_sampler_params, **sampler_params}
+
+        sampler_class = getattr(
+            samplers, f"Flow{self._sampler_prefix}MultiViewGuidanceIntervalSampler",
+            samplers.FlowEulerMultiViewGuidanceIntervalSampler,
+        )
+        sampler = sampler_class(
+            sigma_min=self.tex_slat_sampler.sigma_min,
+            resolution=flow_model.resolution if hasattr(flow_model, 'resolution') else flow_model[0].resolution,
+        )
+
+        if self.low_vram:
+            flow_model.to(self.device)
+        slat = sampler.sample(
+            flow_model, noise, conds=conds, views=views,
+            front_axis=front_axis, blend_temperature=blend_temperature,
+            concat_cond=shape_slat_normalized,
+            **sampler_params, verbose=True, tqdm_desc="Sampling texture SLat (MultiView)",
+        ).samples
+        if self.low_vram:
+            flow_model.cpu()
+            self._cleanup_cuda()
+
+        std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
+        mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)
+        slat = slat * std + mean
+        if self.low_vram:
+            for v in conds:
+                conds[v] = self._cond_cpu(conds[v])
+            self._cleanup_cuda()
+        return slat
+
+    @torch.no_grad()
+    def run_multiview(
+        self,
+        front_image: Image.Image,
+        back_image: Optional[Image.Image] = None,
+        left_image: Optional[Image.Image] = None,
+        right_image: Optional[Image.Image] = None,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+        front_axis: str = 'z',
+        blend_temperature: float = 2.0,
+        sampler: str = 'euler',
+    ) -> List[MeshWithVoxel]:
+        """
+        Run the pipeline with multi-view images and spatial blending.
+
+        Args:
+            front_image: Front view image (required).
+            back_image: Back view image (optional).
+            left_image: Left view image (optional).
+            right_image: Right view image (optional).
+            front_axis: Which axis is 'front' ('z' or 'x').
+            blend_temperature: Sharpness of view blending (higher = sharper).
+            sampler: Sampler type ('euler', 'rk4', 'heun').
+        """
+        self.switch_samplers(sampler)
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        seed_all(seed)
+
+        views_dict = {'front': front_image}
+        if back_image is not None: views_dict['back'] = back_image
+        if left_image is not None: views_dict['left'] = left_image
+        if right_image is not None: views_dict['right'] = right_image
+        views_list = list(views_dict.keys())
+
+        if preprocess_image:
+            views_dict = {k: self.preprocess_image(v) for k, v in views_dict.items()}
+
+        # Conditioning per view
+        conds_512, conds_1024 = {}, {}
+        for v, img in views_dict.items():
+            conds_512[v] = self.get_cond([img], 512)
+            if pipeline_type != '512':
+                conds_1024[v] = self.get_cond([img], 1024)
+
+        # Sparse structure
+        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+        coords = self.sample_sparse_structure_multiview(
+            conds_512, views_list, ss_res, num_samples, sparse_structure_sampler_params,
+            front_axis, blend_temperature,
+        )
+
+        # Shape
+        if pipeline_type == '512':
+            shape_slat = self.sample_shape_slat_multiview(
+                conds_512, views_list, self.models['shape_slat_flow_model_512'],
+                coords, shape_slat_sampler_params, front_axis, blend_temperature,
+            )
+            res = 512
+        elif pipeline_type == '1024':
+            shape_slat = self.sample_shape_slat_multiview(
+                conds_1024, views_list, self.models['shape_slat_flow_model_1024'],
+                coords, shape_slat_sampler_params, front_axis, blend_temperature,
+            )
+            res = 1024
+        elif pipeline_type in ('1024_cascade', '1536_cascade'):
+            target = 1024 if pipeline_type == '1024_cascade' else 1536
+            # For cascade, use front view conds for the existing cascade method
+            shape_slat, res = self.sample_shape_slat_cascade(
+                conds_512[views_list[0]], conds_1024[views_list[0]],
+                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                512, target, coords, shape_slat_sampler_params, max_num_tokens,
+            )
+
+        # Texture (multi-view)
+        tex_conds = conds_1024 if pipeline_type != '512' else conds_512
+        tex_model_key = 'tex_slat_flow_model_512' if pipeline_type == '512' else 'tex_slat_flow_model_1024'
+        tex_slat = self.sample_tex_slat_multiview(
+            tex_conds, views_list, shape_slat, self.models[tex_model_key],
+            tex_slat_sampler_params, front_axis, blend_temperature,
+        )
+
+        torch.cuda.empty_cache()
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        torch.cuda.empty_cache()
+        return out_mesh
