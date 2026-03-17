@@ -1,16 +1,16 @@
 # =============================================================================
 # TRELLIS.2 API — Docker Image
 #
-# Follows the exact installation steps from README / setup.sh:
-#   CUDA 12.4  |  Python 3.10  |  PyTorch 2.6.0+cu124
+# Target: NVIDIA RTX Pro 6000 Blackwell (sm_120)
+# CUDA 12.8  |  Python 3.10  |  PyTorch 2.7.1+cu128
 #
 # Build:  docker build -t trellis2-api:latest .
 # Run:    docker run --gpus all -p 52070:52070 trellis2-api:latest
 # =============================================================================
 
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
-ARG TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+ARG TORCH_CUDA_ARCH_LIST="12.0"
 ARG MAX_JOBS=4
 ARG http_proxy="http://proxy.intra:80"
 ARG https_proxy="http://proxy.intra:80"
@@ -28,7 +28,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
     DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    CUDA_HOME=/usr/local/cuda-12.4 \
+    CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     MAX_JOBS=${MAX_JOBS} \
     SPCONV_ALGO=native \
@@ -37,7 +37,6 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
     HUGGINGFACE_HUB_CACHE=/app/hf_cache
 
 # ── System packages ──────────────────────────────────────────────────────────
-# setup.sh --basic requires libjpeg-dev for pillow-simd
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 python3.10-dev python3-pip \
     build-essential ninja-build cmake git wget curl \
@@ -49,66 +48,67 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
  && python -m pip install --upgrade --no-cache-dir pip setuptools wheel
 
-RUN test -d /usr/local/cuda-12.4 || ln -sf /usr/local/cuda /usr/local/cuda-12.4
-
 WORKDIR /app
 
-# ── setup.sh --new-env: PyTorch 2.6.0 + cu124 ───────────────────────────────
+# ── PyTorch 2.7.1 + cu128 (Blackwell needs CUDA 12.8+) ─────────────────────
 RUN pip install --no-cache-dir \
-    torch==2.6.0 torchvision==0.21.0 \
-    --index-url https://download.pytorch.org/whl/cu124
+    torch==2.7.1 torchvision==0.22.1 \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# ── setup.sh --basic ─────────────────────────────────────────────────────────
+# ── Basic deps (from setup.sh --basic) ───────────────────────────────────────
 RUN pip install --no-cache-dir \
     imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja \
     trimesh transformers tensorboard pandas lpips zstandard \
     pillow-simd kornia timm \
     git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 
-# API deps (not in setup.sh, needed for FastAPI server)
-COPY requirements-api.txt .
+# ── API deps ─────────────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir \
-    fastapi==0.115.5 uvicorn[standard]==0.32.1 python-multipart==0.0.17 \
-    pydantic>=2.0.0 open3d>=0.18.0
+    fastapi==0.115.5 "uvicorn[standard]==0.32.1" python-multipart==0.0.17 \
+    "pydantic>=2.0.0" "open3d>=0.18.0"
 
-# ── setup.sh --flash-attn ────────────────────────────────────────────────────
-RUN pip install --no-cache-dir flash-attn==2.7.3
+# ── flash-attn (from setup.sh --flash-attn) ─────────────────────────────────
+RUN MAX_JOBS=${MAX_JOBS} pip install --no-cache-dir --no-build-isolation \
+    flash-attn
 
-# ── setup.sh --nvdiffrast ────────────────────────────────────────────────────
+# ── nvdiffrast (from setup.sh --nvdiffrast) ──────────────────────────────────
 RUN mkdir -p /tmp/extensions \
  && git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast \
- && pip install /tmp/extensions/nvdiffrast --no-build-isolation
+ && MAX_JOBS=${MAX_JOBS} pip install --no-build-isolation /tmp/extensions/nvdiffrast
 
-# ── setup.sh --nvdiffrec ─────────────────────────────────────────────────────
+# ── nvdiffrec (from setup.sh --nvdiffrec) ────────────────────────────────────
 RUN git clone -b renderutils https://github.com/JeffreyXiang/nvdiffrec.git /tmp/extensions/nvdiffrec \
- && pip install /tmp/extensions/nvdiffrec --no-build-isolation
+ && MAX_JOBS=${MAX_JOBS} pip install --no-build-isolation /tmp/extensions/nvdiffrec
 
-# ── setup.sh --cumesh ────────────────────────────────────────────────────────
+# ── CuMesh (from setup.sh --cumesh) ──────────────────────────────────────────
 RUN git clone https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh --recursive \
- && pip install /tmp/extensions/CuMesh --no-build-isolation
+ && MAX_JOBS=${MAX_JOBS} pip install --no-build-isolation /tmp/extensions/CuMesh
 
-# ── setup.sh --flexgemm ──────────────────────────────────────────────────────
+# ── FlexGEMM (from setup.sh --flexgemm) ──────────────────────────────────────
 RUN git clone https://github.com/JeffreyXiang/FlexGEMM.git /tmp/extensions/FlexGEMM --recursive \
- && pip install /tmp/extensions/FlexGEMM --no-build-isolation
+ && MAX_JOBS=${MAX_JOBS} pip install --no-build-isolation /tmp/extensions/FlexGEMM
 
-# ── setup.sh --o-voxel ───────────────────────────────────────────────────────
-# o-voxel is in-repo; its eigen submodule may not be checked out on server.
-# Copy source then fetch eigen if the submodule dir is empty.
+# ── o-voxel (from setup.sh --o-voxel) ────────────────────────────────────────
 COPY o-voxel/ /tmp/extensions/o-voxel/
 RUN if [ ! -f /tmp/extensions/o-voxel/third_party/eigen/Eigen/Dense ]; then \
         rm -rf /tmp/extensions/o-voxel/third_party/eigen && \
         git clone --depth 1 https://gitlab.com/libeigen/eigen.git \
             /tmp/extensions/o-voxel/third_party/eigen ; \
     fi \
- && pip install /tmp/extensions/o-voxel --no-build-isolation
+ && MAX_JOBS=${MAX_JOBS} pip install --no-build-isolation /tmp/extensions/o-voxel
 
 # ── spconv ───────────────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir spconv-cu120
 
-# ── xformers (optional, fallback attention backend) ──────────────────────────
-RUN pip install --no-cache-dir xformers==0.0.29.post3
+# ── xformers ─────────────────────────────────────────────────────────────────
+RUN pip install --no-cache-dir xformers
 
-# ── Cleanup build artifacts ──────────────────────────────────────────────────
+# ── Re-lock PyTorch (prevent transitive deps from downgrading) ───────────────
+RUN pip install --no-cache-dir --force-reinstall \
+    torch==2.7.1 torchvision==0.22.1 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# ── Cleanup ──────────────────────────────────────────────────────────────────
 RUN rm -rf /tmp/extensions
 
 # ── Application source ───────────────────────────────────────────────────────
