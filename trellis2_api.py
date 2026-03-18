@@ -152,148 +152,109 @@ def load_glb_parts(path: str):
     raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
 
-def preprocess_mesh_with_params(mesh, center, scale):
-    """Preprocess mesh using externally-provided center and scale.
+def split_textured_mesh(textured_mesh, part_face_counts):
+    """Split a textured mesh back into parts using face count boundaries.
 
-    Replicates Trellis2TexturingPipeline.preprocess_mesh() but uses the
-    caller's center/scale so that multiple parts share the same normalization.
+    UV unwrap preserves face count and order, so the face boundaries from
+    the original concatenated parts can be used to split the textured output.
     """
-    vertices = mesh.vertices.copy()
-    vertices = (vertices - center) * scale
-    tmp = vertices[:, 1].copy()
-    vertices[:, 1] = -vertices[:, 2]
-    vertices[:, 2] = tmp
-    return _trimesh.Trimesh(vertices=vertices, faces=mesh.faces, process=False)
+    faces = textured_mesh.faces
+    vertices = textured_mesh.vertices
+    normals = textured_mesh.vertex_normals.copy()
+
+    has_visual = (isinstance(textured_mesh.visual, _trimesh.visual.TextureVisuals)
+                  and textured_mesh.visual.uv is not None)
+    uvs = textured_mesh.visual.uv if has_visual else None
+    material = textured_mesh.visual.material if has_visual else None
+
+    parts = []
+    face_offset = 0
+    for count in part_face_counts:
+        part_faces = faces[face_offset:face_offset + count]
+        unique_verts, inverse = np.unique(part_faces.ravel(), return_inverse=True)
+        new_faces = inverse.reshape(-1, 3)
+        new_vertices = vertices[unique_verts]
+        new_normals = normals[unique_verts]
+
+        if has_visual:
+            new_uvs = uvs[unique_verts]
+            visual = _trimesh.visual.TextureVisuals(uv=new_uvs, material=material)
+        else:
+            visual = None
+
+        part_mesh = _trimesh.Trimesh(
+            vertices=new_vertices,
+            faces=new_faces,
+            vertex_normals=new_normals,
+            process=False,
+            visual=visual,
+        )
+        parts.append(part_mesh)
+        face_offset += count
+
+    return parts
 
 
-@torch.no_grad()
 def texture_multipart(pipe, parts, merged_mesh, image, seed=42,
-                      tex_slat_sampler_params=None, resolution=1024,
-                      texture_size=2048):
-    """Texture a multi-part mesh: shared voxels, per-part postprocess.
+                      resolution=1024, texture_size=2048):
+    """Texture a multi-part mesh: merge → texture once → split by face boundaries.
 
-    1. Compute normalization from merged mesh
-    2. Preprocess + encode + sample + decode on merged mesh (once)
-    3. For each part: preprocess with shared params, postprocess with shared voxels
-    4. Reverse normalization on each textured part
+    1. Record per-part face counts
+    2. Run full pipeline once on merged mesh
+    3. Restore original coordinates (preprocess_mesh centers+scales, postprocess only reverses axis swap)
+    4. Split textured mesh by face count boundaries
     5. Assemble into trimesh.Scene
     """
-    if tex_slat_sampler_params is None:
-        tex_slat_sampler_params = {}
+    part_face_counts = [len(p.faces) for p in parts]
+    logger.info(f"Multipart texture: {len(parts)} parts, face counts={part_face_counts}")
 
-    # --- Normalization params from merged mesh ---
+    # Compute center/scale (same formula as pipeline.preprocess_mesh)
     verts = merged_mesh.vertices
     vmin, vmax = verts.min(axis=0), verts.max(axis=0)
     center = (vmin + vmax) / 2
     scale = 0.99999 / (vmax - vmin).max()
-    logger.info(f"Multipart normalization: center={center.tolist()}, scale={scale:.6f}")
 
-    # --- Encode/sample/decode on merged mesh (GPU-heavy, once) ---
-    image = pipe.preprocess_image(image)
-    merged_preprocessed = preprocess_mesh_with_params(merged_mesh, center, scale)
-    torch.manual_seed(seed)
-    cond_res = 512 if resolution == 512 else 1024
-    cond = pipe.get_cond([image], cond_res)
-    shape_slat = pipe.encode_shape_slat(merged_preprocessed, resolution)
-    tex_model = pipe.models[f'tex_slat_flow_model_{cond_res}']
-    tex_slat = pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_slat_sampler_params)
-    pbr_voxel = pipe.decode_tex_slat(tex_slat)
+    # Run full pipeline once on merged mesh
+    textured = pipe.run(merged_mesh, image, seed=seed,
+                        resolution=resolution, texture_size=texture_size)
 
-    # --- Per-part postprocess + coordinate restoration ---
-    textured_parts = []
-    for i, part in enumerate(parts):
-        logger.info(f"Postprocessing part {i}/{len(parts)} ({len(part.vertices)} verts)...")
-        part_preprocessed = preprocess_mesh_with_params(part, center, scale)
-        textured = pipe.postprocess_mesh(part_preprocessed, pbr_voxel, resolution, texture_size)
-        # postprocess_mesh already reversed axis swap (Z-up -> Y-up).
-        # Now reverse the center/scale normalization:
-        textured.vertices = textured.vertices / scale + center
-        textured_parts.append(textured)
+    # Split by face boundaries (before coord restore to preserve normals cache)
+    textured_parts = split_textured_mesh(textured, part_face_counts)
 
-    # --- Assemble Scene ---
+    # Restore original coordinates on each part
+    for part in textured_parts:
+        part.vertices = part.vertices / scale + center
+
     scene = _trimesh.Scene()
     for i, part in enumerate(textured_parts):
         scene.add_geometry(part, node_name=f"part_{i}")
     return scene
 
 
-@torch.no_grad()
 def texture_multipart_multiview(pipe, parts, merged_mesh,
                                 front_image, back_image=None,
                                 left_image=None, right_image=None,
-                                seed=42, tex_slat_sampler_params=None,
-                                resolution=1024, texture_size=2048,
+                                seed=42, resolution=1024, texture_size=2048,
                                 front_axis='z', blend_temperature=2.0):
-    """Multi-view version of texture_multipart.
+    """Multi-view version of texture_multipart: merge → texture once → split."""
+    part_face_counts = [len(p.faces) for p in parts]
+    logger.info(f"Multipart texture (multiview): {len(parts)} parts, face counts={part_face_counts}")
 
-    Shares the same voxel generation across all parts.
-    Uses the multiview sampler for tex_slat generation.
-    """
-    import random
-    if tex_slat_sampler_params is None:
-        tex_slat_sampler_params = {}
-
-    # --- Normalization from merged mesh ---
     verts = merged_mesh.vertices
     vmin, vmax = verts.min(axis=0), verts.max(axis=0)
     center = (vmin + vmax) / 2
     scale = 0.99999 / (vmax - vmin).max()
 
-    # --- Preprocess images ---
-    views_dict = {'front': front_image}
-    if back_image is not None: views_dict['back'] = back_image
-    if left_image is not None: views_dict['left'] = left_image
-    if right_image is not None: views_dict['right'] = right_image
-    views_list = list(views_dict.keys())
-    views_dict = {k: pipe.preprocess_image(v) for k, v in views_dict.items()}
-
-    # --- Encode merged mesh ---
-    merged_preprocessed = preprocess_mesh_with_params(merged_mesh, center, scale)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    cond_res = 512 if resolution == 512 else 1024
-    conds = {v: pipe.get_cond([img], cond_res) for v, img in views_dict.items()}
-    shape_slat = pipe.encode_shape_slat(merged_preprocessed, resolution)
-
-    # --- Multi-view tex slat sampling (replicated from run_multiview) ---
-    std = torch.tensor(pipe.shape_slat_normalization['std'])[None].to(shape_slat.device)
-    mean = torch.tensor(pipe.shape_slat_normalization['mean'])[None].to(shape_slat.device)
-    shape_slat_normalized = (shape_slat - mean) / std
-
-    flow_model = pipe.models[f'tex_slat_flow_model_{cond_res}']
-    in_channels = flow_model.in_channels
-    noise = shape_slat.replace(
-        feats=torch.randn(shape_slat.coords.shape[0],
-                          in_channels - shape_slat.feats.shape[1]).to(pipe.device)
-    )
-
-    from trellis2.pipelines.samplers import FlowEulerMultiViewGuidanceIntervalSampler
-    sampler = FlowEulerMultiViewGuidanceIntervalSampler(
-        sigma_min=pipe.tex_slat_sampler.sigma_min,
-        resolution=flow_model.resolution,
-    )
-    sampler_params = {**pipe.tex_slat_sampler_params, **tex_slat_sampler_params}
-    slat = sampler.sample(
-        flow_model, noise, conds=conds, views=views_list,
+    textured = pipe.run_multiview(
+        merged_mesh, front_image=front_image, back_image=back_image,
+        left_image=left_image, right_image=right_image,
+        seed=seed, resolution=resolution, texture_size=texture_size,
         front_axis=front_axis, blend_temperature=blend_temperature,
-        concat_cond=shape_slat_normalized,
-        **sampler_params, verbose=True, tqdm_desc="Sampling texture SLat (MultiView)",
-    ).samples
+    )
 
-    std_t = torch.tensor(pipe.tex_slat_normalization['std'])[None].to(slat.device)
-    mean_t = torch.tensor(pipe.tex_slat_normalization['mean'])[None].to(slat.device)
-    slat = slat * std_t + mean_t
-    pbr_voxel = pipe.decode_tex_slat(slat)
-
-    # --- Per-part postprocess + restore ---
-    textured_parts = []
-    for i, part in enumerate(parts):
-        logger.info(f"Postprocessing part {i}/{len(parts)} ({len(part.vertices)} verts)...")
-        part_preprocessed = preprocess_mesh_with_params(part, center, scale)
-        textured = pipe.postprocess_mesh(part_preprocessed, pbr_voxel, resolution, texture_size)
-        textured.vertices = textured.vertices / scale + center
-        textured_parts.append(textured)
+    textured_parts = split_textured_mesh(textured, part_face_counts)
+    for part in textured_parts:
+        part.vertices = part.vertices / scale + center
 
     scene = _trimesh.Scene()
     for i, part in enumerate(textured_parts):
