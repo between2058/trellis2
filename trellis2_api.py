@@ -195,6 +195,89 @@ def texture_multipart(pipe, parts, merged_mesh, image, seed=42,
     return scene
 
 
+def texture_multipart_multiview(pipe, parts, merged_mesh,
+                                front_image, back_image=None,
+                                left_image=None, right_image=None,
+                                seed=42, tex_slat_sampler_params=None,
+                                resolution=1024, texture_size=2048,
+                                front_axis='z', blend_temperature=2.0):
+    """Multi-view version of texture_multipart.
+
+    Shares the same voxel generation across all parts.
+    Uses the multiview sampler for tex_slat generation.
+    """
+    import random
+    if tex_slat_sampler_params is None:
+        tex_slat_sampler_params = {}
+
+    # --- Normalization from merged mesh ---
+    verts = merged_mesh.vertices
+    vmin, vmax = verts.min(axis=0), verts.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
+
+    # --- Preprocess images ---
+    views_dict = {'front': front_image}
+    if back_image is not None: views_dict['back'] = back_image
+    if left_image is not None: views_dict['left'] = left_image
+    if right_image is not None: views_dict['right'] = right_image
+    views_list = list(views_dict.keys())
+    views_dict = {k: pipe.preprocess_image(v) for k, v in views_dict.items()}
+
+    # --- Encode merged mesh ---
+    merged_preprocessed = preprocess_mesh_with_params(merged_mesh, center, scale)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    cond_res = 512 if resolution == 512 else 1024
+    conds = {v: pipe.get_cond([img], cond_res) for v, img in views_dict.items()}
+    shape_slat = pipe.encode_shape_slat(merged_preprocessed, resolution)
+
+    # --- Multi-view tex slat sampling (replicated from run_multiview) ---
+    std = torch.tensor(pipe.shape_slat_normalization['std'])[None].to(shape_slat.device)
+    mean = torch.tensor(pipe.shape_slat_normalization['mean'])[None].to(shape_slat.device)
+    shape_slat_normalized = (shape_slat - mean) / std
+
+    flow_model = pipe.models[f'tex_slat_flow_model_{cond_res}']
+    in_channels = flow_model.in_channels
+    noise = shape_slat.replace(
+        feats=torch.randn(shape_slat.coords.shape[0],
+                          in_channels - shape_slat.feats.shape[1]).to(pipe.device)
+    )
+
+    from trellis2.pipelines.samplers import FlowEulerMultiViewGuidanceIntervalSampler
+    sampler = FlowEulerMultiViewGuidanceIntervalSampler(
+        sigma_min=pipe.tex_slat_sampler.sigma_min,
+        resolution=flow_model.resolution,
+    )
+    sampler_params = {**pipe.tex_slat_sampler_params, **tex_slat_sampler_params}
+    slat = sampler.sample(
+        flow_model, noise, conds=conds, views=views_list,
+        front_axis=front_axis, blend_temperature=blend_temperature,
+        concat_cond=shape_slat_normalized,
+        **sampler_params, verbose=True, tqdm_desc="Sampling texture SLat (MultiView)",
+    ).samples
+
+    std_t = torch.tensor(pipe.tex_slat_normalization['std'])[None].to(slat.device)
+    mean_t = torch.tensor(pipe.tex_slat_normalization['mean'])[None].to(slat.device)
+    slat = slat * std_t + mean_t
+    pbr_voxel = pipe.decode_tex_slat(slat)
+
+    # --- Per-part postprocess + restore ---
+    textured_parts = []
+    for i, part in enumerate(parts):
+        logger.info(f"Postprocessing part {i}/{len(parts)} ({len(part.vertices)} verts)...")
+        part_preprocessed = preprocess_mesh_with_params(part, center, scale)
+        textured = pipe.postprocess_mesh(part_preprocessed, pbr_voxel, resolution, texture_size)
+        textured.vertices = textured.vertices / scale + center
+        textured_parts.append(textured)
+
+    scene = _trimesh.Scene()
+    for i, part in enumerate(textured_parts):
+        scene.add_geometry(part, node_name=f"part_{i}")
+    return scene
+
+
 def log_gpu_memory(label: str):
     if torch.cuda.is_available():
         alloc = torch.cuda.memory_allocated() / 1024**3
@@ -439,7 +522,6 @@ async def texture_mesh_multiview(
     blend_temperature: float = Form(2.0),
 ):
     """Texture an existing mesh with multi-view reference images."""
-
     try:
         request_id = str(uuid.uuid4())
         req_dir = os.path.join(OUTPUT_DIR, request_id)
@@ -461,21 +543,31 @@ async def texture_mesh_multiview(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        mesh = _trimesh.load(mesh_path, force='mesh')
+        parts, merged, is_multipart = load_glb_parts(mesh_path)
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
-            logger.info(f"[{request_id}] Texturing mesh (multi-view)...")
+            logger.info(f"[{request_id}] Texturing mesh (multi-view, multipart={is_multipart}, {len(parts)} parts)...")
 
             def _run():
-                result = tex_pipeline.run_multiview(
-                    mesh, front_image=front_img, back_image=back_img,
-                    left_image=left_img, right_image=right_img,
-                    seed=seed, resolution=resolution, texture_size=texture_size,
-                    front_axis=front_axis, blend_temperature=blend_temperature,
-                )
                 out_path = os.path.join(req_dir, "output.glb")
-                result.export(out_path)
+                if is_multipart:
+                    scene = texture_multipart_multiview(
+                        tex_pipeline, parts, merged,
+                        front_image=front_img, back_image=back_img,
+                        left_image=left_img, right_image=right_img,
+                        seed=seed, resolution=resolution, texture_size=texture_size,
+                        front_axis=front_axis, blend_temperature=blend_temperature,
+                    )
+                    scene.export(out_path)
+                else:
+                    result = tex_pipeline.run_multiview(
+                        merged, front_image=front_img, back_image=back_img,
+                        left_image=left_img, right_image=right_img,
+                        seed=seed, resolution=resolution, texture_size=texture_size,
+                        front_axis=front_axis, blend_temperature=blend_temperature,
+                    )
+                    result.export(out_path)
                 return out_path
 
             out_path = await run_in_threadpool(_run)
