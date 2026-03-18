@@ -8,7 +8,7 @@ from PIL import Image
 class BiRefNet:
     def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
         self.model = AutoModelForImageSegmentation.from_pretrained(
-            model_name, trust_remote_code=True
+            model_name, trust_remote_code=True, device_map="cpu"
         )
         self.model.eval()
         self.transform_image = transforms.Compose(
