@@ -108,20 +108,41 @@ def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000
 def load_glb_parts(path: str):
     """Load GLB and return (parts, merged_mesh, is_multipart).
 
-    For multi-part GLBs: extracts each geometry with its world transform applied,
-    returns list of individual Trimesh objects and a concatenated merged mesh.
-    For single-part GLBs: returns the mesh directly.
+    Groups by scene graph *node* (not by primitive), so a mesh with
+    multiple materials stays as one part.  Each part gets its node's
+    world transform baked in.
     """
     loaded = _trimesh.load(path, process=False)
     if isinstance(loaded, _trimesh.Trimesh):
         return [loaded], loaded, False
     if isinstance(loaded, _trimesh.Scene):
-        parts = [g for g in loaded.dump(concatenate=False)
-                 if isinstance(g, _trimesh.Trimesh)]
-        if not parts:
+        # Group primitives by their scene-graph node.
+        # A single node can reference a geometry that was split into
+        # multiple primitives by trimesh; we merge those back together.
+        node_meshes = {}  # node_name -> list[Trimesh]
+        for node_name in loaded.graph.nodes_geometry:
+            transform, geom_name = loaded.graph[node_name]
+            geom = loaded.geometry[geom_name]
+            if not isinstance(geom, _trimesh.Trimesh):
+                continue
+            mesh_with_tf = geom.copy().apply_transform(transform)
+            node_meshes.setdefault(node_name, []).append(mesh_with_tf)
+
+        if not node_meshes:
             raise ValueError("No mesh geometry found in file")
-        if len(parts) == 1:
-            return parts, parts[0], False
+
+        # Merge primitives that belong to the same node
+        parts = []
+        for node_name, meshes in node_meshes.items():
+            if len(meshes) == 1:
+                parts.append(meshes[0])
+            else:
+                parts.append(_trimesh.util.concatenate(meshes))
+
+        if len(parts) <= 1:
+            merged = parts[0] if parts else None
+            return parts, merged, False
+
         for i, p in enumerate(parts):
             ctr = (p.vertices.max(axis=0) + p.vertices.min(axis=0)) / 2
             logger.info(f"  Part {i}: {len(p.vertices)} verts, center={ctr.tolist()}")
@@ -145,6 +166,7 @@ def preprocess_mesh_with_params(mesh, center, scale):
     return _trimesh.Trimesh(vertices=vertices, faces=mesh.faces, process=False)
 
 
+@torch.no_grad()
 def texture_multipart(pipe, parts, merged_mesh, image, seed=42,
                       tex_slat_sampler_params=None, resolution=1024,
                       texture_size=2048):
@@ -195,6 +217,7 @@ def texture_multipart(pipe, parts, merged_mesh, image, seed=42,
     return scene
 
 
+@torch.no_grad()
 def texture_multipart_multiview(pipe, parts, merged_mesh,
                                 front_image, back_image=None,
                                 left_image=None, right_image=None,
