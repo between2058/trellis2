@@ -108,23 +108,27 @@ def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000
 def load_glb_as_mesh(path: str) -> '_trimesh.Trimesh':
     """Load GLB/OBJ, apply all scene graph node transforms, return single Trimesh.
 
-    trimesh.load(force='mesh') can silently drop node transforms for
-    multi-part GLBs. This function explicitly walks the scene graph,
-    applies each node's world transform, and concatenates the results.
+    Walks the scene graph explicitly so that each node's world-space
+    transform is applied before concatenation.
     """
-    loaded = _trimesh.load(path)
+    loaded = _trimesh.load(path, process=False)
     if isinstance(loaded, _trimesh.Trimesh):
+        logger.info(f"Loaded single mesh: {len(loaded.vertices)} verts")
         return loaded
     if isinstance(loaded, _trimesh.Scene):
-        meshes = []
-        for node_name in loaded.graph.nodes_geometry:
-            transform, geometry_name = loaded.graph[node_name]
-            geom = loaded.geometry[geometry_name]
-            if isinstance(geom, _trimesh.Trimesh):
-                meshes.append(geom.copy().apply_transform(transform))
-        if not meshes:
+        # dump(concatenate=False) yields geometry copies with world transforms applied
+        parts = [g for g in loaded.dump(concatenate=False) if isinstance(g, _trimesh.Trimesh)]
+        if not parts:
             raise ValueError("No mesh geometry found in file")
-        return _trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+        for i, p in enumerate(parts):
+            bbox = p.vertices.max(axis=0) - p.vertices.min(axis=0)
+            ctr = (p.vertices.max(axis=0) + p.vertices.min(axis=0)) / 2
+            logger.info(f"  Part {i}: {len(p.vertices)} verts, center={ctr.tolist()}, extent={bbox.tolist()}")
+        if len(parts) == 1:
+            return parts[0]
+        merged = _trimesh.util.concatenate(parts)
+        logger.info(f"Merged {len(parts)} parts → {len(merged.vertices)} verts, {len(merged.faces)} faces")
+        return merged
     raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
 
@@ -325,23 +329,12 @@ async def texture_mesh(
             shutil.copyfileobj(mesh_file.file, buf)
         mesh = load_glb_as_mesh(mesh_path)
 
-        # Save original bounding box for restoring after texturing
-        orig_min = mesh.vertices.min(axis=0)
-        orig_max = mesh.vertices.max(axis=0)
-        orig_center = (orig_min + orig_max) / 2
-        orig_extent = (orig_max - orig_min).max()
-
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
-            logger.info(f"[{request_id}] Texturing mesh...")
+            logger.info(f"[{request_id}] Texturing mesh ({len(mesh.vertices)} verts, {len(mesh.faces)} faces)...")
 
             def _run():
                 result = tex_pipeline.run(mesh, image, seed=seed, resolution=resolution, texture_size=texture_size)
-                # Restore original scale and position
-                # preprocess_mesh did: v = (v - center) * (0.99999 / extent) then Y/Z swap
-                # postprocess_mesh undid Y/Z swap but not center/scale
-                norm_scale = 0.99999 / orig_extent
-                result.vertices = result.vertices / norm_scale + orig_center
                 out_path = os.path.join(req_dir, "output.glb")
                 result.export(out_path)
                 return out_path
@@ -396,15 +389,9 @@ async def texture_mesh_multiview(
             shutil.copyfileobj(mesh_file.file, buf)
         mesh = load_glb_as_mesh(mesh_path)
 
-        # Save original bounding box for restoring after texturing
-        orig_min = mesh.vertices.min(axis=0)
-        orig_max = mesh.vertices.max(axis=0)
-        orig_center = (orig_min + orig_max) / 2
-        orig_extent = (orig_max - orig_min).max()
-
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
-            logger.info(f"[{request_id}] Texturing mesh (multi-view)...")
+            logger.info(f"[{request_id}] Texturing mesh (multi-view, {len(mesh.vertices)} verts, {len(mesh.faces)} faces)...")
 
             def _run():
                 result = tex_pipeline.run_multiview(
@@ -413,9 +400,6 @@ async def texture_mesh_multiview(
                     seed=seed, resolution=resolution, texture_size=texture_size,
                     front_axis=front_axis, blend_temperature=blend_temperature,
                 )
-                # Restore original scale and position
-                norm_scale = 0.99999 / orig_extent
-                result.vertices = result.vertices / norm_scale + orig_center
                 out_path = os.path.join(req_dir, "output.glb")
                 result.export(out_path)
                 return out_path
