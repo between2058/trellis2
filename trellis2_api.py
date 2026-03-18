@@ -301,7 +301,7 @@ async def texture_mesh(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        mesh = _trimesh.load(mesh_path)
+        mesh = _trimesh.load(mesh_path, force='mesh')
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
@@ -363,7 +363,7 @@ async def texture_mesh_multiview(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        mesh = _trimesh.load(mesh_path)
+        mesh = _trimesh.load(mesh_path, force='mesh')
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
@@ -417,7 +417,7 @@ async def mesh_process(
         mesh_path = os.path.join(req_dir, f"input{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        mesh = _trimesh.load(mesh_path)
+        mesh = _trimesh.load(mesh_path, force='mesh')
 
         def _run():
             if operation == "simplify":
