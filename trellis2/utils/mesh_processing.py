@@ -24,21 +24,20 @@ def simplify_mesh(
         cm = cumesh.CuMesh()
         cm.init(vertices, faces)
         cm.simplify(target_face_num, verbose=True)
-        v_out, f_out = cm.get_vertices(), cm.get_faces()
+        v_out, f_out = cm.read()
     else:
-        import mrmeshpy
-        verts_np = mesh.vertices.astype(np.float32)
+        import meshlib.mrmeshpy as mrmeshpy
+        import meshlib.mrmeshnumpy as mrmeshnumpy
         faces_np = mesh.faces.astype(np.int32)
-        mr_mesh = mrmeshpy.meshFromFV(
-            [mrmeshpy.Vector3f(*v) for v in verts_np],
-            [mrmeshpy.ThreeVertIds(*f) for f in faces_np],
-        )
+        verts_np = mesh.vertices.astype(np.float32)
+        mr_mesh = mrmeshnumpy.meshFromFacesVerts(faces_np, verts_np)
+        mr_mesh.packOptimally()
         settings = mrmeshpy.DecimateSettings()
         settings.maxDeletedFaces = max(0, len(mesh.faces) - target_face_num)
         settings.packMesh = True
         mrmeshpy.decimateMesh(mr_mesh, settings)
-        v_out = torch.from_numpy(np.array([[p.x, p.y, p.z] for p in mr_mesh.points.vec])).float()
-        f_out = torch.from_numpy(np.array([[f[0], f[1], f[2]] for f in mr_mesh.topology.getValidFaces()])).int()
+        v_out = torch.from_numpy(mrmeshnumpy.getNumpyVerts(mr_mesh)).float()
+        f_out = torch.from_numpy(mrmeshnumpy.getNumpyFaces(mr_mesh.topology)).int()
 
     return trimesh.Trimesh(
         vertices=v_out.cpu().numpy(),
@@ -87,21 +86,18 @@ def remesh_dual_contouring(
 def fill_holes(mesh: trimesh.Trimesh, method: Literal['meshlib', 'cumesh'] = 'meshlib', max_perimeter: float = 0.03) -> trimesh.Trimesh:
     """Fill holes in mesh."""
     if method == 'meshlib':
-        import mrmeshpy
-        verts = mesh.vertices.astype(np.float32)
-        faces = mesh.faces.astype(np.int32)
-        mr_mesh = mrmeshpy.meshFromFV(
-            [mrmeshpy.Vector3f(*v) for v in verts],
-            [mrmeshpy.ThreeVertIds(*f) for f in faces],
-        )
+        import meshlib.mrmeshpy as mrmeshpy
+        import meshlib.mrmeshnumpy as mrmeshnumpy
+        faces_np = mesh.faces.astype(np.int32)
+        verts_np = mesh.vertices.astype(np.float32)
+        mr_mesh = mrmeshnumpy.meshFromFacesVerts(faces_np, verts_np)
         hole_edges = mr_mesh.topology.findHoleRepresentiveEdges()
         for edge in hole_edges:
             params = mrmeshpy.FillHoleParams()
             params.metric = mrmeshpy.getUniversalMetric(mr_mesh)
             mrmeshpy.fillHole(mr_mesh, edge, params)
-        v_out = np.array([[p.x, p.y, p.z] for p in mr_mesh.points.vec], dtype=np.float32)
-        f_valid = mr_mesh.topology.getValidFaces()
-        f_out = np.array([[f[0], f[1], f[2]] for f in f_valid], dtype=np.int32)
+        v_out = mrmeshnumpy.getNumpyVerts(mr_mesh)
+        f_out = mrmeshnumpy.getNumpyFaces(mr_mesh.topology)
         return trimesh.Trimesh(vertices=v_out, faces=f_out, process=False)
     else:
         import cumesh
@@ -110,17 +106,19 @@ def fill_holes(mesh: trimesh.Trimesh, method: Literal['meshlib', 'cumesh'] = 'me
         cm = cumesh.CuMesh()
         cm.init(vertices, faces)
         cm.fill_holes(max_hole_perimeter=max_perimeter)
+        v_out, f_out = cm.read()
         return trimesh.Trimesh(
-            vertices=cm.get_vertices().cpu().numpy(),
-            faces=cm.get_faces().cpu().numpy(),
+            vertices=v_out.cpu().numpy(),
+            faces=f_out.cpu().numpy(),
             process=False,
         )
 
 
 def smooth_normals(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Compute smooth vertex normals."""
+    """Compute smooth vertex normals (area-weighted)."""
     new_mesh = mesh.copy()
-    new_mesh.vertex_normals = trimesh.smoothing.get_vertices_normals(mesh)
+    # trimesh auto-computes area-weighted vertex normals; force recalculation
+    new_mesh.vertex_normals  # noqa: triggers computation
     return new_mesh
 
 
@@ -137,9 +135,9 @@ def laplacian_smooth(
     o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
 
     if method == 'laplacian':
-        o3d_mesh = o3d_mesh.filter_smooth_laplacian(iterations)
+        o3d_mesh = o3d_mesh.filter_smooth_laplacian(number_of_iterations=iterations)
     else:
-        o3d_mesh = o3d_mesh.filter_smooth_taubin(iterations)
+        o3d_mesh = o3d_mesh.filter_smooth_taubin(number_of_iterations=iterations)
 
     return trimesh.Trimesh(
         vertices=np.asarray(o3d_mesh.vertices),
