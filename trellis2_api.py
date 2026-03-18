@@ -105,181 +105,6 @@ def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000
     glb.export(glb_path, extension_webp=True)
 
 
-def load_glb_parts(path: str):
-    """Load GLB and return (parts, merged_mesh, is_multipart).
-
-    Groups by scene graph *node* (not by primitive), so a mesh with
-    multiple materials stays as one part.  Each part gets its node's
-    world transform baked in.
-    """
-    loaded = _trimesh.load(path, process=False)
-    if isinstance(loaded, _trimesh.Trimesh):
-        return [loaded], loaded, False
-    if isinstance(loaded, _trimesh.Scene):
-        # Group primitives by their scene-graph node.
-        # A single node can reference a geometry that was split into
-        # multiple primitives by trimesh; we merge those back together.
-        node_meshes = {}  # node_name -> list[Trimesh]
-        for node_name in loaded.graph.nodes_geometry:
-            transform, geom_name = loaded.graph[node_name]
-            geom = loaded.geometry[geom_name]
-            if not isinstance(geom, _trimesh.Trimesh):
-                continue
-            mesh_with_tf = geom.copy().apply_transform(transform)
-            node_meshes.setdefault(node_name, []).append(mesh_with_tf)
-
-        if not node_meshes:
-            raise ValueError("No mesh geometry found in file")
-
-        # Merge primitives that belong to the same node
-        parts = []
-        for node_name, meshes in node_meshes.items():
-            if len(meshes) == 1:
-                parts.append(meshes[0])
-            else:
-                parts.append(_trimesh.util.concatenate(meshes))
-
-        if len(parts) <= 1:
-            merged = parts[0] if parts else None
-            return parts, merged, False
-
-        for i, p in enumerate(parts):
-            ctr = (p.vertices.max(axis=0) + p.vertices.min(axis=0)) / 2
-            logger.info(f"  Part {i}: {len(p.vertices)} verts, center={ctr.tolist()}")
-        merged = _trimesh.util.concatenate(parts)
-        logger.info(f"Merged {len(parts)} parts -> {len(merged.vertices)} verts")
-        return parts, merged, True
-    raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
-
-
-def split_textured_mesh(textured_mesh, part_face_counts):
-    """Split a textured mesh back into parts using face count boundaries.
-
-    UV unwrap preserves face count and order, so the face boundaries from
-    the original concatenated parts can be used to split the textured output.
-
-    Returns None if face count mismatch (UV unwrap changed topology).
-    """
-    total_expected = sum(part_face_counts)
-    actual = len(textured_mesh.faces)
-    if actual != total_expected:
-        logger.warning(
-            f"Face count mismatch after texturing: expected {total_expected}, got {actual}. "
-            f"Skipping split — returning single textured mesh."
-        )
-        return None
-
-    faces = textured_mesh.faces
-    vertices = textured_mesh.vertices
-    normals = textured_mesh.vertex_normals.copy()
-
-    has_visual = (isinstance(textured_mesh.visual, _trimesh.visual.TextureVisuals)
-                  and textured_mesh.visual.uv is not None)
-    uvs = textured_mesh.visual.uv if has_visual else None
-    material = textured_mesh.visual.material if has_visual else None
-
-    parts = []
-    face_offset = 0
-    for i, count in enumerate(part_face_counts):
-        part_faces = faces[face_offset:face_offset + count]
-        if len(part_faces) == 0:
-            logger.warning(f"Part {i} has 0 faces, skipping")
-            face_offset += count
-            continue
-        unique_verts, inverse = np.unique(part_faces.ravel(), return_inverse=True)
-        new_faces = inverse.reshape(-1, 3)
-        new_vertices = vertices[unique_verts]
-
-        kwargs = dict(vertices=new_vertices, faces=new_faces, process=False)
-        if len(unique_verts) > 0 and len(normals) > 0:
-            kwargs['vertex_normals'] = normals[unique_verts]
-        if has_visual and len(unique_verts) > 0:
-            kwargs['visual'] = _trimesh.visual.TextureVisuals(
-                uv=uvs[unique_verts], material=material)
-
-        parts.append(_trimesh.Trimesh(**kwargs))
-        face_offset += count
-
-    return parts
-
-
-def texture_multipart(pipe, parts, merged_mesh, image, seed=42,
-                      resolution=1024, texture_size=2048):
-    """Texture a multi-part mesh: merge → texture once → split by face boundaries.
-
-    1. Record per-part face counts
-    2. Run full pipeline once on merged mesh
-    3. Restore original coordinates (preprocess_mesh centers+scales, postprocess only reverses axis swap)
-    4. Split textured mesh by face count boundaries
-    5. Assemble into trimesh.Scene
-    """
-    part_face_counts = [len(p.faces) for p in parts]
-    logger.info(f"Multipart texture: {len(parts)} parts, face counts={part_face_counts}")
-
-    # Compute center/scale (same formula as pipeline.preprocess_mesh)
-    verts = merged_mesh.vertices
-    vmin, vmax = verts.min(axis=0), verts.max(axis=0)
-    center = (vmin + vmax) / 2
-    scale = 0.99999 / (vmax - vmin).max()
-
-    # Run full pipeline once on merged mesh
-    textured = pipe.run(merged_mesh, image, seed=seed,
-                        resolution=resolution, texture_size=texture_size)
-
-    # Split by face boundaries (before coord restore to preserve normals cache)
-    textured_parts = split_textured_mesh(textured, part_face_counts)
-
-    if textured_parts is None:
-        # Face count mismatch — return single textured mesh with restored coords
-        textured.vertices = textured.vertices / scale + center
-        return textured
-
-    # Restore original coordinates on each part
-    for part in textured_parts:
-        part.vertices = part.vertices / scale + center
-
-    scene = _trimesh.Scene()
-    for i, part in enumerate(textured_parts):
-        scene.add_geometry(part, node_name=f"part_{i}")
-    return scene
-
-
-def texture_multipart_multiview(pipe, parts, merged_mesh,
-                                front_image, back_image=None,
-                                left_image=None, right_image=None,
-                                seed=42, resolution=1024, texture_size=2048,
-                                front_axis='z', blend_temperature=2.0):
-    """Multi-view version of texture_multipart: merge → texture once → split."""
-    part_face_counts = [len(p.faces) for p in parts]
-    logger.info(f"Multipart texture (multiview): {len(parts)} parts, face counts={part_face_counts}")
-
-    verts = merged_mesh.vertices
-    vmin, vmax = verts.min(axis=0), verts.max(axis=0)
-    center = (vmin + vmax) / 2
-    scale = 0.99999 / (vmax - vmin).max()
-
-    textured = pipe.run_multiview(
-        merged_mesh, front_image=front_image, back_image=back_image,
-        left_image=left_image, right_image=right_image,
-        seed=seed, resolution=resolution, texture_size=texture_size,
-        front_axis=front_axis, blend_temperature=blend_temperature,
-    )
-
-    textured_parts = split_textured_mesh(textured, part_face_counts)
-
-    if textured_parts is None:
-        textured.vertices = textured.vertices / scale + center
-        return textured
-
-    for part in textured_parts:
-        part.vertices = part.vertices / scale + center
-
-    scene = _trimesh.Scene()
-    for i, part in enumerate(textured_parts):
-        scene.add_geometry(part, node_name=f"part_{i}")
-    return scene
-
-
 def log_gpu_memory(label: str):
     if torch.cuda.is_available():
         alloc = torch.cuda.memory_allocated() / 1024**3
@@ -303,6 +128,173 @@ def ensure_model_loaded():
         tex_pipeline.cuda()
         log_gpu_memory("tex pipeline loaded")
         logger.info("Texturing pipeline loaded.")
+
+
+# =============================================================================
+# Multi-part GLB helpers
+# =============================================================================
+
+def load_glb_parts(path: str):
+    """Load GLB and return (parts, merged_mesh, is_multipart).
+
+    Groups meshes by scene-graph node so that a single node with multiple
+    primitives stays as one part.  Each part gets its world transform baked in.
+    Parts with 0 faces are filtered out.
+    """
+    loaded = _trimesh.load(path, process=False)
+
+    if isinstance(loaded, _trimesh.Trimesh):
+        return [loaded], loaded, False
+
+    if isinstance(loaded, _trimesh.Scene):
+        node_meshes = {}
+        for node_name in loaded.graph.nodes_geometry:
+            transform, geom_name = loaded.graph[node_name]
+            geom = loaded.geometry[geom_name]
+            if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
+                continue
+            mesh = geom.copy().apply_transform(transform)
+            node_meshes.setdefault(node_name, []).append(mesh)
+
+        if not node_meshes:
+            raise ValueError("No mesh geometry found in GLB")
+
+        parts = []
+        for meshes in node_meshes.values():
+            part = meshes[0] if len(meshes) == 1 else _trimesh.util.concatenate(meshes)
+            if len(part.faces) > 0:
+                parts.append(part)
+
+        if len(parts) <= 1:
+            single = parts[0] if parts else None
+            return parts, single, False
+
+        merged = _trimesh.util.concatenate(parts)
+        logger.info(f"Loaded {len(parts)} parts, merged: {len(merged.vertices)} verts, {len(merged.faces)} faces")
+        return parts, merged, True
+
+    raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
+
+
+def split_textured_mesh(textured, part_face_counts):
+    """Split textured mesh back into parts using face-count boundaries.
+
+    UV unwrap preserves face count and order, so the concatenation boundaries
+    from the original parts can split the pipeline output.
+
+    Returns list of Trimesh parts, or None if face counts don't match.
+    """
+    expected = sum(part_face_counts)
+    actual = len(textured.faces)
+    logger.info(f"Split check: expected {expected} faces, textured has {actual}")
+
+    if actual != expected:
+        logger.warning(f"Face count mismatch — cannot split into parts")
+        return None
+
+    faces = textured.faces
+    verts = textured.vertices
+
+    try:
+        normals = textured.vertex_normals.copy()
+    except Exception:
+        normals = None
+
+    has_uv = (isinstance(textured.visual, _trimesh.visual.TextureVisuals)
+              and textured.visual.uv is not None)
+    uvs = textured.visual.uv if has_uv else None
+    material = textured.visual.material if has_uv else None
+
+    parts = []
+    offset = 0
+    for count in part_face_counts:
+        pf = faces[offset:offset + count]
+        offset += count
+        if len(pf) == 0:
+            continue
+
+        uv_idx, remap = np.unique(pf.ravel(), return_inverse=True)
+        new_faces = remap.reshape(-1, 3)
+        new_verts = verts[uv_idx]
+
+        kwargs = dict(vertices=new_verts, faces=new_faces, process=False)
+        if normals is not None:
+            kwargs['vertex_normals'] = normals[uv_idx]
+        if has_uv:
+            kwargs['visual'] = _trimesh.visual.TextureVisuals(
+                uv=uvs[uv_idx], material=material)
+
+        parts.append(_trimesh.Trimesh(**kwargs))
+
+    return parts
+
+
+def texture_multipart(pipe, parts, merged, image, seed=42,
+                      resolution=1024, texture_size=2048):
+    """Texture multi-part GLB: merge → run pipeline once → split → restore coords."""
+    face_counts = [len(p.faces) for p in parts]
+    logger.info(f"Multipart texture: {len(parts)} parts, face_counts={face_counts}")
+
+    # Same formula as pipeline.preprocess_mesh — needed to reverse later
+    v = merged.vertices
+    vmin, vmax = v.min(axis=0), v.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
+
+    # GPU work runs exactly once regardless of part count
+    textured = pipe.run(merged, image, seed=seed,
+                        resolution=resolution, texture_size=texture_size)
+
+    result_parts = split_textured_mesh(textured, face_counts)
+
+    if result_parts is None:
+        # Fallback: return whole textured mesh (no part structure)
+        textured.vertices = textured.vertices / scale + center
+        return textured
+
+    for part in result_parts:
+        part.vertices = part.vertices / scale + center
+
+    scene = _trimesh.Scene()
+    for i, part in enumerate(result_parts):
+        scene.add_geometry(part, node_name=f"part_{i}")
+    return scene
+
+
+def texture_multipart_multiview(pipe, parts, merged,
+                                front_image, back_image=None,
+                                left_image=None, right_image=None,
+                                seed=42, resolution=1024, texture_size=2048,
+                                front_axis='z', blend_temperature=2.0):
+    """Multi-view version of texture_multipart."""
+    face_counts = [len(p.faces) for p in parts]
+    logger.info(f"Multipart texture (multiview): {len(parts)} parts, face_counts={face_counts}")
+
+    v = merged.vertices
+    vmin, vmax = v.min(axis=0), v.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
+
+    textured = pipe.run_multiview(
+        merged, front_image=front_image, back_image=back_image,
+        left_image=left_image, right_image=right_image,
+        seed=seed, resolution=resolution, texture_size=texture_size,
+        front_axis=front_axis, blend_temperature=blend_temperature,
+    )
+
+    result_parts = split_textured_mesh(textured, face_counts)
+
+    if result_parts is None:
+        textured.vertices = textured.vertices / scale + center
+        return textured
+
+    for part in result_parts:
+        part.vertices = part.vertices / scale + center
+
+    scene = _trimesh.Scene()
+    for i, part in enumerate(result_parts):
+        scene.add_geometry(part, node_name=f"part_{i}")
+    return scene
 
 
 # =============================================================================
@@ -484,17 +476,16 @@ async def texture_mesh(
             def _run():
                 out_path = os.path.join(req_dir, "output.glb")
                 if is_multipart:
-                    scene = texture_multipart(
+                    result = texture_multipart(
                         tex_pipeline, parts, merged, image,
                         seed=seed, resolution=resolution, texture_size=texture_size,
                     )
-                    scene.export(out_path)
                 else:
                     result = tex_pipeline.run(
                         merged, image, seed=seed,
                         resolution=resolution, texture_size=texture_size,
                     )
-                    result.export(out_path)
+                result.export(out_path)
                 return out_path
 
             out_path = await run_in_threadpool(_run)
@@ -554,14 +545,13 @@ async def texture_mesh_multiview(
             def _run():
                 out_path = os.path.join(req_dir, "output.glb")
                 if is_multipart:
-                    scene = texture_multipart_multiview(
+                    result = texture_multipart_multiview(
                         tex_pipeline, parts, merged,
                         front_image=front_img, back_image=back_img,
                         left_image=left_img, right_image=right_img,
                         seed=seed, resolution=resolution, texture_size=texture_size,
                         front_axis=front_axis, blend_temperature=blend_temperature,
                     )
-                    scene.export(out_path)
                 else:
                     result = tex_pipeline.run_multiview(
                         merged, front_image=front_img, back_image=back_img,
@@ -569,7 +559,7 @@ async def texture_mesh_multiview(
                         seed=seed, resolution=resolution, texture_size=texture_size,
                         front_axis=front_axis, blend_temperature=blend_temperature,
                     )
-                    result.export(out_path)
+                result.export(out_path)
                 return out_path
 
             out_path = await run_in_threadpool(_run)
@@ -587,7 +577,6 @@ async def texture_mesh_multiview(
 
 async def _load_and_process_mesh(mesh_file: UploadFile, process_fn):
     """Shared helper: load mesh, apply process_fn, export result."""
-
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)
     os.makedirs(req_dir, exist_ok=True)
