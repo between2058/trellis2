@@ -137,6 +137,15 @@ curl -X POST http://localhost:52070/texture \
   -F "texture_size=2048"
 ```
 
+**Multi-Part GLB 支援：**
+
+當輸入的 mesh 為多零件 GLB 時，API 自動偵測並：
+1. 套用各零件的 scene graph transform
+2. 合併後統一生成 PBR voxel（GPU 只跑一次）
+3. 每個零件獨立 UV unwrap + 貼圖取樣
+4. 還原各零件原始座標
+5. 輸出保留零件結構的多零件 GLB
+
 ---
 
 ### `POST /texture-multiview`
@@ -159,6 +168,8 @@ curl -X POST http://localhost:52070/texture \
 | `blend_temperature` | float | 2.0 | 混合溫度 |
 
 **Response:** 同 `/generate`
+
+**Multi-Part GLB 支援：** 同 `/texture`，自動偵測多零件 GLB 並保留零件結構。
 
 ---
 
