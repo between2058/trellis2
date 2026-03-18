@@ -393,61 +393,121 @@ async def texture_mesh_multiview(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/mesh-process")
-async def mesh_process(
-    mesh_file: UploadFile = File(...),
-    operation: str = Form(..., description="Operation: simplify, remesh, fill_holes, smooth_normals, laplacian_smooth, weld_vertices"),
-    target_face_num: int = Form(100000),
-    resolution: int = Form(512),
-    iterations: int = Form(5),
-    method: str = Form("cumesh"),
-):
-    """Apply mesh processing operations."""
+async def _load_and_process_mesh(mesh_file: UploadFile, process_fn):
+    """Shared helper: load mesh, apply process_fn, export result."""
     import trimesh as _trimesh
-    from trellis2.utils.mesh_processing import (
-        simplify_mesh, remesh_dual_contouring, fill_holes,
-        smooth_normals, laplacian_smooth, weld_vertices,
-    )
 
+    request_id = str(uuid.uuid4())
+    req_dir = os.path.join(OUTPUT_DIR, request_id)
+    os.makedirs(req_dir, exist_ok=True)
+
+    mesh_path = os.path.join(req_dir, f"input{os.path.splitext(mesh_file.filename)[1]}")
+    with open(mesh_path, "wb") as buf:
+        shutil.copyfileobj(mesh_file.file, buf)
+    mesh = _trimesh.load(mesh_path, force='mesh')
+
+    result = await run_in_threadpool(process_fn, mesh)
+
+    out_path = os.path.join(req_dir, "output.glb")
+    result.export(out_path)
+
+    return {
+        "request_id": request_id,
+        "glb_url": f"/download/{request_id}/output.glb",
+        "vertices": len(result.vertices),
+        "faces": len(result.faces),
+    }
+
+
+@app.post("/mesh-process/simplify")
+async def mesh_simplify(
+    mesh_file: UploadFile = File(...),
+    target_face_num: int = Form(100000, description="Target number of faces after simplification"),
+    method: str = Form("cumesh", description="Backend: 'cumesh' (GPU) or 'meshlib' (CPU)"),
+):
+    """Reduce mesh face count while preserving shape."""
+    from trellis2.utils.mesh_processing import simplify_mesh
     try:
-        request_id = str(uuid.uuid4())
-        req_dir = os.path.join(OUTPUT_DIR, request_id)
-        os.makedirs(req_dir, exist_ok=True)
-
-        mesh_path = os.path.join(req_dir, f"input{os.path.splitext(mesh_file.filename)[1]}")
-        with open(mesh_path, "wb") as buf:
-            shutil.copyfileobj(mesh_file.file, buf)
-        mesh = _trimesh.load(mesh_path, force='mesh')
-
-        def _run():
-            if operation == "simplify":
-                return simplify_mesh(mesh, target_face_num, method=method)
-            elif operation == "remesh":
-                return remesh_dual_contouring(mesh, resolution=resolution)
-            elif operation == "fill_holes":
-                return fill_holes(mesh, method=method)
-            elif operation == "smooth_normals":
-                return smooth_normals(mesh)
-            elif operation == "laplacian_smooth":
-                return laplacian_smooth(mesh, iterations=iterations, method=method)
-            elif operation == "weld_vertices":
-                return weld_vertices(mesh)
-            else:
-                raise ValueError(f"Unknown operation: {operation}")
-
-        result = await run_in_threadpool(_run)
-
-        out_path = os.path.join(req_dir, "output.glb")
-        result.export(out_path)
-
-        return {
-            "request_id": request_id,
-            "glb_url": f"/download/{request_id}/output.glb",
-            "vertices": len(result.vertices),
-            "faces": len(result.faces),
-        }
+        return await _load_and_process_mesh(
+            mesh_file, lambda m: simplify_mesh(m, target_face_num, method=method)
+        )
     except Exception as e:
-        logger.error(f"Mesh-process failed: {e}", exc_info=True)
+        logger.error(f"Simplify failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mesh-process/remesh")
+async def mesh_remesh(
+    mesh_file: UploadFile = File(...),
+    resolution: int = Form(512, description="Dual contouring grid resolution"),
+):
+    """Rebuild mesh topology using dual contouring."""
+    from trellis2.utils.mesh_processing import remesh_dual_contouring
+    try:
+        return await _load_and_process_mesh(
+            mesh_file, lambda m: remesh_dual_contouring(m, resolution=resolution)
+        )
+    except Exception as e:
+        logger.error(f"Remesh failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mesh-process/fill-holes")
+async def mesh_fill_holes(
+    mesh_file: UploadFile = File(...),
+    method: str = Form("meshlib", description="Backend: 'meshlib' (optimal triangulation) or 'cumesh' (boundary-based)"),
+):
+    """Fill holes in mesh."""
+    from trellis2.utils.mesh_processing import fill_holes
+    try:
+        return await _load_and_process_mesh(
+            mesh_file, lambda m: fill_holes(m, method=method)
+        )
+    except Exception as e:
+        logger.error(f"Fill holes failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mesh-process/smooth-normals")
+async def mesh_smooth_normals(
+    mesh_file: UploadFile = File(...),
+):
+    """Compute smooth vertex normals."""
+    from trellis2.utils.mesh_processing import smooth_normals
+    try:
+        return await _load_and_process_mesh(mesh_file, smooth_normals)
+    except Exception as e:
+        logger.error(f"Smooth normals failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mesh-process/laplacian-smooth")
+async def mesh_laplacian_smooth(
+    mesh_file: UploadFile = File(...),
+    iterations: int = Form(5, description="Number of smoothing iterations"),
+    method: str = Form("laplacian", description="Smoothing method: 'laplacian' or 'taubin'"),
+):
+    """Smooth mesh geometry using Laplacian or Taubin smoothing."""
+    from trellis2.utils.mesh_processing import laplacian_smooth
+    try:
+        return await _load_and_process_mesh(
+            mesh_file, lambda m: laplacian_smooth(m, iterations=iterations, method=method)
+        )
+    except Exception as e:
+        logger.error(f"Laplacian smooth failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mesh-process/weld-vertices")
+async def mesh_weld_vertices(
+    mesh_file: UploadFile = File(...),
+):
+    """Merge duplicate vertices."""
+    from trellis2.utils.mesh_processing import weld_vertices
+    try:
+        return await _load_and_process_mesh(mesh_file, weld_vertices)
+    except Exception as e:
+        logger.error(f"Weld vertices failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

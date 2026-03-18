@@ -162,33 +162,11 @@ curl -X POST http://localhost:52070/texture \
 
 ---
 
-### `POST /mesh-process`
+### Mesh 後處理端點
 
-Mesh 後處理操作。
+所有 mesh 後處理操作各自獨立為單一端點，每個端點只包含該操作所需的參數。
 
-**Request:** `multipart/form-data`
-
-| 參數 | 型別 | 預設 | 說明 |
-|------|------|------|------|
-| `mesh_file` | file | (必填) | Mesh 檔案 |
-| `operation` | string | (必填) | 操作類型（見下表） |
-| `target_face_num` | int | 100000 | 目標面數（simplify 用） |
-| `resolution` | int | 512 | 重建解析度（remesh 用） |
-| `iterations` | int | 5 | 平滑迭代次數 |
-| `method` | string | `"cumesh"` | 後端方法 |
-
-**支援的操作：**
-
-| Operation | 說明 | 相關參數 |
-|-----------|------|----------|
-| `simplify` | 減面 | `target_face_num`, `method` (`cumesh`/`meshlib`) |
-| `remesh` | Dual Contouring 重建拓撲 | `resolution` |
-| `fill_holes` | 填補孔洞 | `method` (`meshlib`/`cumesh`) |
-| `smooth_normals` | 平滑法線 | — |
-| `laplacian_smooth` | Laplacian/Taubin 平滑 | `iterations`, `method` (`laplacian`/`taubin`) |
-| `weld_vertices` | 合併重複頂點 | — |
-
-**Response:**
+**共用回應格式：**
 
 ```json
 {
@@ -199,13 +177,105 @@ Mesh 後處理操作。
 }
 ```
 
-**cURL 範例:**
+---
+
+#### `POST /mesh-process/simplify`
+
+減少 mesh 面數，保持形狀。
+
+| 參數 | 型別 | 預設 | 說明 |
+|------|------|------|------|
+| `mesh_file` | file | (必填) | Mesh 檔案 (.glb/.obj) |
+| `target_face_num` | int | 100000 | 目標面數 |
+| `method` | string | `"cumesh"` | 後端：`cumesh` (GPU) 或 `meshlib` (CPU) |
 
 ```bash
-curl -X POST http://localhost:52070/mesh-process \
+curl -X POST http://localhost:52070/mesh-process/simplify \
   -F "mesh_file=@model.glb" \
-  -F "operation=simplify" \
   -F "target_face_num=50000"
+```
+
+---
+
+#### `POST /mesh-process/remesh`
+
+使用 Dual Contouring 重建 mesh 拓撲。
+
+| 參數 | 型別 | 預設 | 說明 |
+|------|------|------|------|
+| `mesh_file` | file | (必填) | Mesh 檔案 |
+| `resolution` | int | 512 | Grid 解析度 |
+
+```bash
+curl -X POST http://localhost:52070/mesh-process/remesh \
+  -F "mesh_file=@model.glb" \
+  -F "resolution=512"
+```
+
+---
+
+#### `POST /mesh-process/fill-holes`
+
+填補 mesh 孔洞。
+
+| 參數 | 型別 | 預設 | 說明 |
+|------|------|------|------|
+| `mesh_file` | file | (必填) | Mesh 檔案 |
+| `method` | string | `"meshlib"` | 後端：`meshlib`（最佳三角化）或 `cumesh`（邊界法） |
+
+```bash
+curl -X POST http://localhost:52070/mesh-process/fill-holes \
+  -F "mesh_file=@model.glb" \
+  -F "method=meshlib"
+```
+
+---
+
+#### `POST /mesh-process/smooth-normals`
+
+計算平滑頂點法線。無額外參數。
+
+| 參數 | 型別 | 預設 | 說明 |
+|------|------|------|------|
+| `mesh_file` | file | (必填) | Mesh 檔案 |
+
+```bash
+curl -X POST http://localhost:52070/mesh-process/smooth-normals \
+  -F "mesh_file=@model.glb"
+```
+
+---
+
+#### `POST /mesh-process/laplacian-smooth`
+
+Laplacian 或 Taubin 幾何平滑。
+
+| 參數 | 型別 | 預設 | 說明 |
+|------|------|------|------|
+| `mesh_file` | file | (必填) | Mesh 檔案 |
+| `iterations` | int | 5 | 平滑迭代次數 |
+| `method` | string | `"laplacian"` | 平滑方法：`laplacian` 或 `taubin` |
+
+```bash
+curl -X POST http://localhost:52070/mesh-process/laplacian-smooth \
+  -F "mesh_file=@model.glb" \
+  -F "iterations=10" \
+  -F "method=taubin"
+```
+
+---
+
+#### `POST /mesh-process/weld-vertices`
+
+合併重複頂點。無額外參數。
+
+| 參數 | 型別 | 預設 | 說明 |
+|------|------|------|------|
+| `mesh_file` | file | (必填) | Mesh 檔案 |
+
+```bash
+curl -X POST http://localhost:52070/mesh-process/weld-vertices \
+  -F "mesh_file=@model.glb"
 ```
 
 ---
