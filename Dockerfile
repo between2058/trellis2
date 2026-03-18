@@ -58,7 +58,7 @@ RUN pip install --no-cache-dir \
 # ── Basic deps (from setup.sh --basic) ───────────────────────────────────────
 RUN pip install --no-cache-dir \
     imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja \
-    trimesh transformers tensorboard pandas lpips zstandard \
+    trimesh transformers accelerate tensorboard pandas lpips zstandard \
     pillow-simd kornia timm \
     git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 
