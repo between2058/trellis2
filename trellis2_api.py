@@ -22,7 +22,6 @@ from fastapi.concurrency import run_in_threadpool
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.pipelines.trellis2_texturing import Trellis2TexturingPipeline
 import o_voxel
-import trimesh as _trimesh
 
 
 # =============================================================================
@@ -103,33 +102,6 @@ def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000
         verbose=True,
     )
     glb.export(glb_path, extension_webp=True)
-
-
-def load_glb_as_mesh(path: str) -> '_trimesh.Trimesh':
-    """Load GLB/OBJ, apply all scene graph node transforms, return single Trimesh.
-
-    Walks the scene graph explicitly so that each node's world-space
-    transform is applied before concatenation.
-    """
-    loaded = _trimesh.load(path, process=False)
-    if isinstance(loaded, _trimesh.Trimesh):
-        logger.info(f"Loaded single mesh: {len(loaded.vertices)} verts")
-        return loaded
-    if isinstance(loaded, _trimesh.Scene):
-        # dump(concatenate=False) yields geometry copies with world transforms applied
-        parts = [g for g in loaded.dump(concatenate=False) if isinstance(g, _trimesh.Trimesh)]
-        if not parts:
-            raise ValueError("No mesh geometry found in file")
-        for i, p in enumerate(parts):
-            bbox = p.vertices.max(axis=0) - p.vertices.min(axis=0)
-            ctr = (p.vertices.max(axis=0) + p.vertices.min(axis=0)) / 2
-            logger.info(f"  Part {i}: {len(p.vertices)} verts, center={ctr.tolist()}, extent={bbox.tolist()}")
-        if len(parts) == 1:
-            return parts[0]
-        merged = _trimesh.util.concatenate(parts)
-        logger.info(f"Merged {len(parts)} parts → {len(merged.vertices)} verts, {len(merged.faces)} faces")
-        return merged
-    raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
 
 def log_gpu_memory(label: str):
@@ -314,6 +286,8 @@ async def texture_mesh(
     texture_size: int = Form(2048),
 ):
     """Texture an existing mesh with a reference image."""
+    import trimesh as _trimesh
+
     try:
         request_id = str(uuid.uuid4())
         req_dir = os.path.join(OUTPUT_DIR, request_id)
@@ -327,11 +301,11 @@ async def texture_mesh(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        mesh = load_glb_as_mesh(mesh_path)
+        mesh = _trimesh.load(mesh_path, force='mesh')
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
-            logger.info(f"[{request_id}] Texturing mesh ({len(mesh.vertices)} verts, {len(mesh.faces)} faces)...")
+            logger.info(f"[{request_id}] Texturing mesh...")
 
             def _run():
                 result = tex_pipeline.run(mesh, image, seed=seed, resolution=resolution, texture_size=texture_size)
@@ -366,6 +340,8 @@ async def texture_mesh_multiview(
     blend_temperature: float = Form(2.0),
 ):
     """Texture an existing mesh with multi-view reference images."""
+    import trimesh as _trimesh
+
     try:
         request_id = str(uuid.uuid4())
         req_dir = os.path.join(OUTPUT_DIR, request_id)
@@ -387,11 +363,11 @@ async def texture_mesh_multiview(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        mesh = load_glb_as_mesh(mesh_path)
+        mesh = _trimesh.load(mesh_path, force='mesh')
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
-            logger.info(f"[{request_id}] Texturing mesh (multi-view, {len(mesh.vertices)} verts, {len(mesh.faces)} faces)...")
+            logger.info(f"[{request_id}] Texturing mesh (multi-view)...")
 
             def _run():
                 result = tex_pipeline.run_multiview(
@@ -419,6 +395,8 @@ async def texture_mesh_multiview(
 
 async def _load_and_process_mesh(mesh_file: UploadFile, process_fn):
     """Shared helper: load mesh, apply process_fn, export result."""
+    import trimesh as _trimesh
+
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)
     os.makedirs(req_dir, exist_ok=True)
@@ -426,7 +404,7 @@ async def _load_and_process_mesh(mesh_file: UploadFile, process_fn):
     mesh_path = os.path.join(req_dir, f"input{os.path.splitext(mesh_file.filename)[1]}")
     with open(mesh_path, "wb") as buf:
         shutil.copyfileobj(mesh_file.file, buf)
-    mesh = load_glb_as_mesh(mesh_path)
+    mesh = _trimesh.load(mesh_path, force='mesh')
 
     result = await run_in_threadpool(process_fn, mesh)
 
