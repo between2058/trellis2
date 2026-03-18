@@ -21,6 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.pipelines.trellis2_texturing import Trellis2TexturingPipeline
+import o_voxel
 
 
 # =============================================================================
@@ -81,6 +82,26 @@ logger.info(f"Output directory: {OUTPUT_DIR}")
 pipeline = None
 tex_pipeline = None
 gpu_lock = asyncio.Lock()
+
+
+def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000000):
+    """Convert MeshWithVoxel to GLB via o_voxel.postprocess."""
+    glb = o_voxel.postprocess.to_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=mesh.layout,
+        voxel_size=mesh.voxel_size,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        decimation_target=decimation_target,
+        texture_size=texture_size,
+        remesh=True,
+        remesh_band=1,
+        remesh_project=0,
+        verbose=True,
+    )
+    glb.export(glb_path, extension_webp=True)
 
 
 def log_gpu_memory(label: str):
@@ -163,7 +184,7 @@ async def generate(
                 )
                 mesh = results[0]
                 glb_path = os.path.join(req_dir, "output.glb")
-                mesh.export(glb_path)
+                export_mesh_to_glb(mesh, glb_path, texture_size=texture_size)
                 return glb_path
 
             glb_path = await run_in_threadpool(_run)
@@ -240,7 +261,7 @@ async def generate_multiview(
                 )
                 mesh = results[0]
                 glb_path = os.path.join(req_dir, "output.glb")
-                mesh.export(glb_path)
+                export_mesh_to_glb(mesh, glb_path)
                 return glb_path
 
             glb_path = await run_in_threadpool(_run)
