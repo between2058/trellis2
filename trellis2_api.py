@@ -377,7 +377,6 @@ async def texture_mesh(
     texture_size: int = Form(2048),
 ):
     """Texture an existing mesh with a reference image."""
-
     try:
         request_id = str(uuid.uuid4())
         req_dir = os.path.join(OUTPUT_DIR, request_id)
@@ -391,16 +390,26 @@ async def texture_mesh(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        mesh = _trimesh.load(mesh_path, force='mesh')
+        parts, merged, is_multipart = load_glb_parts(mesh_path)
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
-            logger.info(f"[{request_id}] Texturing mesh...")
+            logger.info(f"[{request_id}] Texturing mesh (multipart={is_multipart}, {len(parts)} parts)...")
 
             def _run():
-                result = tex_pipeline.run(mesh, image, seed=seed, resolution=resolution, texture_size=texture_size)
                 out_path = os.path.join(req_dir, "output.glb")
-                result.export(out_path)
+                if is_multipart:
+                    scene = texture_multipart(
+                        tex_pipeline, parts, merged, image,
+                        seed=seed, resolution=resolution, texture_size=texture_size,
+                    )
+                    scene.export(out_path)
+                else:
+                    result = tex_pipeline.run(
+                        merged, image, seed=seed,
+                        resolution=resolution, texture_size=texture_size,
+                    )
+                    result.export(out_path)
                 return out_path
 
             out_path = await run_in_threadpool(_run)
