@@ -176,79 +176,99 @@ def load_glb_parts(path: str):
     raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
 
-def split_textured_mesh(textured, part_face_counts):
-    """Split textured mesh back into parts using face-count boundaries.
-
-    UV unwrap preserves face count and order, so the concatenation boundaries
-    from the original parts can split the pipeline output.
-
-    Returns list of Trimesh parts, or None if face counts don't match.
-    """
-    expected = sum(part_face_counts)
-    actual = len(textured.faces)
-    logger.info(f"Split check: expected {expected} faces, textured has {actual}")
-
-    if actual != expected:
-        logger.warning(f"Face count mismatch — cannot split into parts")
+def _extract_submesh(textured, face_mask):
+    """Extract a sub-mesh from textured mesh using a boolean face mask."""
+    faces = textured.faces[face_mask]
+    if len(faces) == 0:
         return None
 
-    faces = textured.faces
-    verts = textured.vertices
+    uv_idx, remap = np.unique(faces.ravel(), return_inverse=True)
+    new_faces = remap.reshape(-1, 3)
+    new_verts = textured.vertices[uv_idx]
+
+    kwargs = dict(vertices=new_verts, faces=new_faces, process=False)
 
     try:
-        normals = textured.vertex_normals.copy()
+        kwargs['vertex_normals'] = textured.vertex_normals[uv_idx]
     except Exception:
-        normals = None
+        pass
 
     has_uv = (isinstance(textured.visual, _trimesh.visual.TextureVisuals)
               and textured.visual.uv is not None)
-    uvs = textured.visual.uv if has_uv else None
-    material = textured.visual.material if has_uv else None
+    if has_uv:
+        kwargs['visual'] = _trimesh.visual.TextureVisuals(
+            uv=textured.visual.uv[uv_idx],
+            material=textured.visual.material)
 
-    parts = []
-    offset = 0
-    for count in part_face_counts:
-        pf = faces[offset:offset + count]
-        offset += count
-        if len(pf) == 0:
+    return _trimesh.Trimesh(**kwargs)
+
+
+def split_textured_mesh(textured, parts, center, scale):
+    """Split textured mesh back into original parts using vertex position matching.
+
+    After pipeline.run():
+      - preprocess_mesh normalizes: v_norm = (v_orig - center) * scale, then axis swap
+      - postprocess_mesh UV unwraps (may duplicate/remove vertices), then undoes axis swap
+      - Result vertices are at: (v_orig - center) * scale  (axis swaps cancel out)
+
+    We match each textured vertex to the closest original part vertex (also in
+    normalized space) via KD-tree, then group faces by part assignment.
+    """
+    from scipy.spatial import cKDTree
+
+    # Build normalized vertex positions for each part + a part-ID label per vertex
+    all_norm = []
+    all_part_id = []
+    for i, part in enumerate(parts):
+        norm = (part.vertices - center) * scale
+        all_norm.append(norm)
+        all_part_id.append(np.full(len(norm), i, dtype=np.int32))
+
+    all_norm = np.vstack(all_norm).astype(np.float64)
+    all_part_id = np.concatenate(all_part_id)
+
+    tree = cKDTree(all_norm)
+
+    # Textured vertices are already in normalized space (axis swaps cancelled)
+    dists, indices = tree.query(textured.vertices.astype(np.float64))
+    max_dist = dists.max()
+    logger.info(f"Vertex matching: max_dist={max_dist:.8f}, mean_dist={dists.mean():.8f}")
+
+    if max_dist > 0.01:
+        logger.warning(f"Spatial matching too imprecise (max_dist={max_dist:.4f}), giving up split")
+        return None
+
+    # Each textured vertex → part ID
+    vert_part = all_part_id[indices]
+
+    # Each face → part ID (use first vertex; all 3 should agree)
+    face_part = vert_part[textured.faces[:, 0]]
+
+    n_parts = len(parts)
+    result = []
+    for i in range(n_parts):
+        mask = face_part == i
+        n_faces = mask.sum()
+        if n_faces == 0:
+            logger.warning(f"Part {i}: 0 faces after matching, skipping")
             continue
+        logger.info(f"Part {i}: {n_faces} faces (original {len(parts[i].faces)})")
+        sub = _extract_submesh(textured, mask)
+        if sub is not None:
+            result.append(sub)
 
-        uv_idx, remap = np.unique(pf.ravel(), return_inverse=True)
-        new_faces = remap.reshape(-1, 3)
-        new_verts = verts[uv_idx]
-
-        kwargs = dict(vertices=new_verts, faces=new_faces, process=False)
-        if normals is not None:
-            kwargs['vertex_normals'] = normals[uv_idx]
-        if has_uv:
-            kwargs['visual'] = _trimesh.visual.TextureVisuals(
-                uv=uvs[uv_idx], material=material)
-
-        parts.append(_trimesh.Trimesh(**kwargs))
-
-    return parts
+    return result if len(result) > 0 else None
 
 
-def texture_multipart(pipe, parts, merged, image, seed=42,
-                      resolution=1024, texture_size=2048):
-    """Texture multi-part GLB: merge → run pipeline once → split → restore coords."""
-    face_counts = [len(p.faces) for p in parts]
-    logger.info(f"Multipart texture: {len(parts)} parts, face_counts={face_counts}")
+def _run_and_split(textured, parts, center, scale):
+    """Split textured mesh, restore coordinates, assemble Scene.
 
-    # Same formula as pipeline.preprocess_mesh — needed to reverse later
-    v = merged.vertices
-    vmin, vmax = v.min(axis=0), v.max(axis=0)
-    center = (vmin + vmax) / 2
-    scale = 0.99999 / (vmax - vmin).max()
-
-    # GPU work runs exactly once regardless of part count
-    textured = pipe.run(merged, image, seed=seed,
-                        resolution=resolution, texture_size=texture_size)
-
-    result_parts = split_textured_mesh(textured, face_counts)
+    Returns a trimesh.Scene (multipart) or trimesh.Trimesh (fallback).
+    """
+    result_parts = split_textured_mesh(textured, parts, center, scale)
 
     if result_parts is None:
-        # Fallback: return whole textured mesh (no part structure)
+        logger.warning("Split failed — returning single textured mesh")
         textured.vertices = textured.vertices / scale + center
         return textured
 
@@ -261,14 +281,33 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     return scene
 
 
+def texture_multipart(pipe, parts, merged, image, seed=42,
+                      resolution=1024, texture_size=2048):
+    """Texture multi-part GLB: merge → run pipeline once → split → restore coords."""
+    logger.info(f"Multipart texture: {len(parts)} parts, "
+                f"merged={len(merged.faces)} faces")
+
+    v = merged.vertices
+    vmin, vmax = v.min(axis=0), v.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
+
+    textured = pipe.run(merged, image, seed=seed,
+                        resolution=resolution, texture_size=texture_size)
+    logger.info(f"Pipeline output: {len(textured.faces)} faces, "
+                f"{len(textured.vertices)} verts")
+
+    return _run_and_split(textured, parts, center, scale)
+
+
 def texture_multipart_multiview(pipe, parts, merged,
                                 front_image, back_image=None,
                                 left_image=None, right_image=None,
                                 seed=42, resolution=1024, texture_size=2048,
                                 front_axis='z', blend_temperature=2.0):
     """Multi-view version of texture_multipart."""
-    face_counts = [len(p.faces) for p in parts]
-    logger.info(f"Multipart texture (multiview): {len(parts)} parts, face_counts={face_counts}")
+    logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
+                f"merged={len(merged.faces)} faces")
 
     v = merged.vertices
     vmin, vmax = v.min(axis=0), v.max(axis=0)
@@ -281,20 +320,10 @@ def texture_multipart_multiview(pipe, parts, merged,
         seed=seed, resolution=resolution, texture_size=texture_size,
         front_axis=front_axis, blend_temperature=blend_temperature,
     )
+    logger.info(f"Pipeline output: {len(textured.faces)} faces, "
+                f"{len(textured.vertices)} verts")
 
-    result_parts = split_textured_mesh(textured, face_counts)
-
-    if result_parts is None:
-        textured.vertices = textured.vertices / scale + center
-        return textured
-
-    for part in result_parts:
-        part.vertices = part.vertices / scale + center
-
-    scene = _trimesh.Scene()
-    for i, part in enumerate(result_parts):
-        scene.add_geometry(part, node_name=f"part_{i}")
-    return scene
+    return _run_and_split(textured, parts, center, scale)
 
 
 # =============================================================================
