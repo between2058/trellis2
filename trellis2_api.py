@@ -22,6 +22,7 @@ from fastapi.concurrency import run_in_threadpool
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.pipelines.trellis2_texturing import Trellis2TexturingPipeline
 import o_voxel
+import trimesh as _trimesh
 
 
 # =============================================================================
@@ -102,6 +103,96 @@ def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000
         verbose=True,
     )
     glb.export(glb_path, extension_webp=True)
+
+
+def load_glb_parts(path: str):
+    """Load GLB and return (parts, merged_mesh, is_multipart).
+
+    For multi-part GLBs: extracts each geometry with its world transform applied,
+    returns list of individual Trimesh objects and a concatenated merged mesh.
+    For single-part GLBs: returns the mesh directly.
+    """
+    loaded = _trimesh.load(path, process=False)
+    if isinstance(loaded, _trimesh.Trimesh):
+        return [loaded], loaded, False
+    if isinstance(loaded, _trimesh.Scene):
+        parts = [g for g in loaded.dump(concatenate=False)
+                 if isinstance(g, _trimesh.Trimesh)]
+        if not parts:
+            raise ValueError("No mesh geometry found in file")
+        if len(parts) == 1:
+            return parts, parts[0], False
+        for i, p in enumerate(parts):
+            ctr = (p.vertices.max(axis=0) + p.vertices.min(axis=0)) / 2
+            logger.info(f"  Part {i}: {len(p.vertices)} verts, center={ctr.tolist()}")
+        merged = _trimesh.util.concatenate(parts)
+        logger.info(f"Merged {len(parts)} parts -> {len(merged.vertices)} verts")
+        return parts, merged, True
+    raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
+
+
+def preprocess_mesh_with_params(mesh, center, scale):
+    """Preprocess mesh using externally-provided center and scale.
+
+    Replicates Trellis2TexturingPipeline.preprocess_mesh() but uses the
+    caller's center/scale so that multiple parts share the same normalization.
+    """
+    vertices = mesh.vertices.copy()
+    vertices = (vertices - center) * scale
+    tmp = vertices[:, 1].copy()
+    vertices[:, 1] = -vertices[:, 2]
+    vertices[:, 2] = tmp
+    return _trimesh.Trimesh(vertices=vertices, faces=mesh.faces, process=False)
+
+
+def texture_multipart(pipe, parts, merged_mesh, image, seed=42,
+                      tex_slat_sampler_params=None, resolution=1024,
+                      texture_size=2048):
+    """Texture a multi-part mesh: shared voxels, per-part postprocess.
+
+    1. Compute normalization from merged mesh
+    2. Preprocess + encode + sample + decode on merged mesh (once)
+    3. For each part: preprocess with shared params, postprocess with shared voxels
+    4. Reverse normalization on each textured part
+    5. Assemble into trimesh.Scene
+    """
+    if tex_slat_sampler_params is None:
+        tex_slat_sampler_params = {}
+
+    # --- Normalization params from merged mesh ---
+    verts = merged_mesh.vertices
+    vmin, vmax = verts.min(axis=0), verts.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
+    logger.info(f"Multipart normalization: center={center.tolist()}, scale={scale:.6f}")
+
+    # --- Encode/sample/decode on merged mesh (GPU-heavy, once) ---
+    image = pipe.preprocess_image(image)
+    merged_preprocessed = preprocess_mesh_with_params(merged_mesh, center, scale)
+    torch.manual_seed(seed)
+    cond_res = 512 if resolution == 512 else 1024
+    cond = pipe.get_cond([image], cond_res)
+    shape_slat = pipe.encode_shape_slat(merged_preprocessed, resolution)
+    tex_model = pipe.models[f'tex_slat_flow_model_{cond_res}']
+    tex_slat = pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_slat_sampler_params)
+    pbr_voxel = pipe.decode_tex_slat(tex_slat)
+
+    # --- Per-part postprocess + coordinate restoration ---
+    textured_parts = []
+    for i, part in enumerate(parts):
+        logger.info(f"Postprocessing part {i}/{len(parts)} ({len(part.vertices)} verts)...")
+        part_preprocessed = preprocess_mesh_with_params(part, center, scale)
+        textured = pipe.postprocess_mesh(part_preprocessed, pbr_voxel, resolution, texture_size)
+        # postprocess_mesh already reversed axis swap (Z-up -> Y-up).
+        # Now reverse the center/scale normalization:
+        textured.vertices = textured.vertices / scale + center
+        textured_parts.append(textured)
+
+    # --- Assemble Scene ---
+    scene = _trimesh.Scene()
+    for i, part in enumerate(textured_parts):
+        scene.add_geometry(part, node_name=f"part_{i}")
+    return scene
 
 
 def log_gpu_memory(label: str):
@@ -286,7 +377,6 @@ async def texture_mesh(
     texture_size: int = Form(2048),
 ):
     """Texture an existing mesh with a reference image."""
-    import trimesh as _trimesh
 
     try:
         request_id = str(uuid.uuid4())
@@ -340,7 +430,6 @@ async def texture_mesh_multiview(
     blend_temperature: float = Form(2.0),
 ):
     """Texture an existing mesh with multi-view reference images."""
-    import trimesh as _trimesh
 
     try:
         request_id = str(uuid.uuid4())
@@ -395,7 +484,6 @@ async def texture_mesh_multiview(
 
 async def _load_and_process_mesh(mesh_file: UploadFile, process_fn):
     """Shared helper: load mesh, apply process_fn, export result."""
-    import trimesh as _trimesh
 
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)
