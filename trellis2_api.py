@@ -260,8 +260,12 @@ def split_textured_mesh(textured, parts, center, scale):
     return result if len(result) > 0 else None
 
 
-def _run_and_split(textured, parts, center, scale):
-    """Split textured mesh, restore coordinates, assemble Scene.
+def _split_and_assemble(textured, parts, center, scale):
+    """Split textured mesh into parts and assemble Scene.
+
+    No coordinate restoration needed — pipeline output is in normalized space
+    ([-0.5, 0.5]) with correct relative positions since we merged first.
+    This matches the single-part pipeline output behavior.
 
     Returns a trimesh.Scene (multipart) or trimesh.Trimesh (fallback).
     """
@@ -269,11 +273,7 @@ def _run_and_split(textured, parts, center, scale):
 
     if result_parts is None:
         logger.warning("Split failed — returning single textured mesh")
-        textured.vertices = textured.vertices / scale + center
         return textured
-
-    for part in result_parts:
-        part.vertices = part.vertices / scale + center
 
     scene = _trimesh.Scene()
     for i, part in enumerate(result_parts):
@@ -283,10 +283,11 @@ def _run_and_split(textured, parts, center, scale):
 
 def texture_multipart(pipe, parts, merged, image, seed=42,
                       resolution=1024, texture_size=2048):
-    """Texture multi-part GLB: merge → run pipeline once → split → restore coords."""
+    """Texture multi-part GLB: merge → run pipeline once → split."""
     logger.info(f"Multipart texture: {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
 
+    # center/scale needed for KD-tree matching (not for coord restoration)
     v = merged.vertices
     vmin, vmax = v.min(axis=0), v.max(axis=0)
     center = (vmin + vmax) / 2
@@ -297,7 +298,7 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _run_and_split(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale)
 
 
 def texture_multipart_multiview(pipe, parts, merged,
@@ -323,7 +324,7 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _run_and_split(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale)
 
 
 # =============================================================================
