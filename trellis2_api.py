@@ -157,7 +157,18 @@ def split_textured_mesh(textured_mesh, part_face_counts):
 
     UV unwrap preserves face count and order, so the face boundaries from
     the original concatenated parts can be used to split the textured output.
+
+    Returns None if face count mismatch (UV unwrap changed topology).
     """
+    total_expected = sum(part_face_counts)
+    actual = len(textured_mesh.faces)
+    if actual != total_expected:
+        logger.warning(
+            f"Face count mismatch after texturing: expected {total_expected}, got {actual}. "
+            f"Skipping split — returning single textured mesh."
+        )
+        return None
+
     faces = textured_mesh.faces
     vertices = textured_mesh.vertices
     normals = textured_mesh.vertex_normals.copy()
@@ -169,27 +180,24 @@ def split_textured_mesh(textured_mesh, part_face_counts):
 
     parts = []
     face_offset = 0
-    for count in part_face_counts:
+    for i, count in enumerate(part_face_counts):
         part_faces = faces[face_offset:face_offset + count]
+        if len(part_faces) == 0:
+            logger.warning(f"Part {i} has 0 faces, skipping")
+            face_offset += count
+            continue
         unique_verts, inverse = np.unique(part_faces.ravel(), return_inverse=True)
         new_faces = inverse.reshape(-1, 3)
         new_vertices = vertices[unique_verts]
-        new_normals = normals[unique_verts]
 
-        if has_visual:
-            new_uvs = uvs[unique_verts]
-            visual = _trimesh.visual.TextureVisuals(uv=new_uvs, material=material)
-        else:
-            visual = None
+        kwargs = dict(vertices=new_vertices, faces=new_faces, process=False)
+        if len(unique_verts) > 0 and len(normals) > 0:
+            kwargs['vertex_normals'] = normals[unique_verts]
+        if has_visual and len(unique_verts) > 0:
+            kwargs['visual'] = _trimesh.visual.TextureVisuals(
+                uv=uvs[unique_verts], material=material)
 
-        part_mesh = _trimesh.Trimesh(
-            vertices=new_vertices,
-            faces=new_faces,
-            vertex_normals=new_normals,
-            process=False,
-            visual=visual,
-        )
-        parts.append(part_mesh)
+        parts.append(_trimesh.Trimesh(**kwargs))
         face_offset += count
 
     return parts
@@ -220,6 +228,11 @@ def texture_multipart(pipe, parts, merged_mesh, image, seed=42,
 
     # Split by face boundaries (before coord restore to preserve normals cache)
     textured_parts = split_textured_mesh(textured, part_face_counts)
+
+    if textured_parts is None:
+        # Face count mismatch — return single textured mesh with restored coords
+        textured.vertices = textured.vertices / scale + center
+        return textured
 
     # Restore original coordinates on each part
     for part in textured_parts:
@@ -253,6 +266,11 @@ def texture_multipart_multiview(pipe, parts, merged_mesh,
     )
 
     textured_parts = split_textured_mesh(textured, part_face_counts)
+
+    if textured_parts is None:
+        textured.vertices = textured.vertices / scale + center
+        return textured
+
     for part in textured_parts:
         part.vertices = part.vertices / scale + center
 
