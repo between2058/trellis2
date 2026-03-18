@@ -123,7 +123,7 @@ def ensure_model_loaded():
 
     if tex_pipeline is None:
         logger.info("Loading texturing pipeline...")
-        tex_pipeline = Trellis2TexturingPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+        tex_pipeline = Trellis2TexturingPipeline.from_pretrained("microsoft/TRELLIS.2-4B", config_file="texturing_pipeline.json")
         tex_pipeline.cuda()
         log_gpu_memory("tex pipeline loaded")
         logger.info("Texturing pipeline loaded.")
