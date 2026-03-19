@@ -135,24 +135,24 @@ def ensure_model_loaded():
 # =============================================================================
 
 def load_glb_parts(path: str):
-    """Load GLB and return (parts, merged_mesh, is_multipart).
+    """Load GLB and return (parts, merged_mesh, is_multipart, pre_norm).
 
-    Uses force='mesh' as ground truth for the merged mesh (handles all GLB
-    structures correctly). Extracts individual parts from the scene graph
-    with world transforms baked in. If the parts don't match force='mesh',
-    falls back to single-mesh mode.
+    For multipart GLBs, pre-normalizes all parts and the merged mesh to
+    [-0.5, 0.5] range (emulates parenting to an Empty in Blender).
+    Returns pre_norm=(center, scale) so the output can restore world coords
+    via a parent Empty transform.
     """
     loaded = _trimesh.load(path, process=False)
 
     if isinstance(loaded, _trimesh.Trimesh):
-        return [loaded], loaded, False
+        return [loaded], loaded, False, None
 
     if not isinstance(loaded, _trimesh.Scene):
         raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
     # Ground truth: force='mesh' correctly handles ALL transform structures
     merged_ref = _trimesh.load(path, force='mesh', process=False)
-    ref_bbox = merged_ref.bounds  # (2, 3) array: [min, max]
+    ref_bbox = merged_ref.bounds
     logger.info(f"force='mesh' reference: {len(merged_ref.vertices)} verts, "
                 f"bbox_range={ref_bbox[1] - ref_bbox[0]}")
 
@@ -163,18 +163,11 @@ def load_glb_parts(path: str):
         geom = loaded.geometry[geom_name]
         if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
             continue
-
-        local_center = (geom.bounds[0] + geom.bounds[1]) / 2
-        translation = transform[:3, 3]
-        is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        logger.debug(f"  Node '{node_name}': local_center={local_center.tolist()}, "
-                     f"translation={translation.tolist()}, identity={is_identity}")
-
         mesh = geom.copy().apply_transform(transform)
         node_meshes.setdefault(node_name, []).append(mesh)
 
     if not node_meshes:
-        return [merged_ref], merged_ref, False
+        return [merged_ref], merged_ref, False, None
 
     parts = []
     for meshes in node_meshes.values():
@@ -183,7 +176,7 @@ def load_glb_parts(path: str):
             parts.append(part)
 
     if len(parts) <= 1:
-        return [merged_ref], merged_ref, False
+        return [merged_ref], merged_ref, False, None
 
     # Verify: our concatenated parts should match force='mesh' bounding box
     concat = _trimesh.util.concatenate(parts)
@@ -194,26 +187,37 @@ def load_glb_parts(path: str):
                 f"match_ref={bbox_match}")
 
     if not bbox_match:
-        logger.warning(
-            f"Part extraction bbox mismatch! "
-            f"ref={ref_bbox.tolist()} vs ours={concat_bbox.tolist()}. "
-            f"Retrying with scene.dump()..."
-        )
-        # scene.dump applies transforms the same way force='mesh' does internally
+        logger.warning(f"Part extraction bbox mismatch! Retrying with scene.dump()...")
         dumped = loaded.dump(concatenate=False)
         parts = [m for m in dumped
                  if isinstance(m, _trimesh.Trimesh) and len(m.faces) > 0]
         if len(parts) <= 1:
-            return [merged_ref], merged_ref, False
+            return [merged_ref], merged_ref, False, None
         concat2 = _trimesh.util.concatenate(parts)
         bbox_match2 = np.allclose(ref_bbox, concat2.bounds, atol=0.01)
         logger.info(f"scene.dump() gave {len(parts)} parts, match_ref={bbox_match2}")
         if not bbox_match2:
             logger.warning("Still mismatched — falling back to single mesh")
-            return [merged_ref], merged_ref, False
+            return [merged_ref], merged_ref, False, None
 
-    # Always use force='mesh' for the pipeline input (guaranteed correct)
-    return parts, merged_ref, True
+    # Pre-normalize: emulate Blender's "parent to Empty" — bring all parts
+    # into [-0.5, 0.5] range so downstream centroid transforms stay small.
+    v = merged_ref.vertices
+    vmin, vmax = v.min(axis=0), v.max(axis=0)
+    pre_center = (vmin + vmax) / 2
+    pre_scale = 0.99999 / (vmax - vmin).max()
+
+    for part in parts:
+        part.vertices = (part.vertices - pre_center) * pre_scale
+    merged_ref = _trimesh.Trimesh(
+        vertices=(merged_ref.vertices - pre_center) * pre_scale,
+        faces=merged_ref.faces, process=False,
+    )
+
+    logger.info(f"Pre-normalized {len(parts)} parts to [-0.5, 0.5] "
+                f"(center={pre_center.tolist()}, scale={pre_scale:.8f})")
+
+    return parts, merged_ref, True, (pre_center, pre_scale)
 
 
 def _extract_submesh(textured, face_mask):
@@ -300,20 +304,16 @@ def split_textured_mesh(textured, parts, center, scale):
     return result if len(result) > 0 else None
 
 
-def _split_and_assemble(textured, parts, center, scale):
-    """Split textured mesh into parts, assemble Scene with transform-based positioning.
+def _split_and_assemble(textured, parts, center, scale, pre_norm=None):
+    """Split textured mesh into parts, assemble as hierarchical Scene.
 
-    GLB format uses float32 for vertices — large world coordinates (±100K+) cause
-    precision/rendering issues. Instead, we keep each part's vertices in local space
-    (centered at its own centroid) and use the Scene graph transform to position it
-    at the correct world location. This matches how most GLB files store multi-part
-    scenes (small local coords + node transform).
+    Emulates Blender's "Empty parent → mesh children" structure:
+      - Parent Empty carries the world-restore transform (pre_norm)
+      - Each part has small centroid-based transform (float32-safe)
+      - Part vertices stay near origin
 
-    Flow:
-      1. Split textured mesh (normalized space) into per-part submeshes
-      2. Restore each part to world coordinates: v_world = v_norm / scale + center
-      3. Center each part at its own centroid (small local coords)
-      4. Add to Scene with centroid as translation transform
+    This hierarchical structure works where flat structures with large
+    transforms fail.
     """
     result_parts = split_textured_mesh(textured, parts, center, scale)
 
@@ -322,27 +322,56 @@ def _split_and_assemble(textured, parts, center, scale):
         return textured
 
     scene = _trimesh.Scene()
+
+    # Parent Empty: restores world coordinates from pre-normalization
+    if pre_norm is not None:
+        pre_center, pre_scale = pre_norm
+        inv_pre_scale = 1.0 / pre_scale
+        parent_transform = np.eye(4)
+        parent_transform[0, 0] = inv_pre_scale
+        parent_transform[1, 1] = inv_pre_scale
+        parent_transform[2, 2] = inv_pre_scale
+        parent_transform[:3, 3] = pre_center
+        parent_node = 'world_root'
+        scene.graph.update(
+            frame_from=scene.graph.base_frame,
+            frame_to=parent_node,
+            matrix=parent_transform,
+        )
+        logger.info(f"Parent Empty: inv_scale={inv_pre_scale:.2f}, "
+                    f"center={pre_center.tolist()}")
+    else:
+        parent_node = None
+
     for i, part in enumerate(result_parts):
-        # Restore to world coordinates
+        # Undo pipeline's normalization (near no-op since input was pre-normalized)
         part.vertices = part.vertices / scale + center
-        # Move to local space: vertices centered at centroid, transform holds position
+        # Center at centroid — values are small since we're in pre-normalized space
         centroid = (part.vertices.min(0) + part.vertices.max(0)) / 2
         part.vertices -= centroid
-        transform = np.eye(4)
-        transform[:3, 3] = centroid
-        scene.add_geometry(part, node_name=f"part_{i}", transform=transform)
-        logger.debug(f"Part {i}: {len(part.faces)} faces, centroid={centroid.tolist()}")
+        child_transform = np.eye(4)
+        child_transform[:3, 3] = centroid
 
-    logger.info(f"Assembled {len(result_parts)} parts, "
+        if parent_node:
+            scene.add_geometry(
+                part, node_name=f"part_{i}", geom_name=f"part_{i}_geom",
+                parent_node_name=parent_node, transform=child_transform,
+            )
+        else:
+            scene.add_geometry(
+                part, node_name=f"part_{i}", transform=child_transform,
+            )
+
+    logger.info(f"Assembled {len(result_parts)} parts (hierarchical={parent_node is not None}), "
                 f"bounds={scene.bounds.tolist() if scene.bounds is not None else 'None'}")
     return scene
 
 
 def texture_multipart(pipe, parts, merged, image, seed=42,
-                      resolution=1024, texture_size=2048):
-    """Texture multi-part GLB: merge → run pipeline once → split."""
+                      resolution=1024, texture_size=2048, pre_norm=None):
+    """Texture multi-part GLB: merge → run pipeline once → split → hierarchical Scene."""
     logger.info(f"Multipart texture: {len(parts)} parts, "
-                f"merged={len(merged.faces)} faces")
+                f"merged={len(merged.faces)} faces, pre_norm={pre_norm is not None}")
 
     v = merged.vertices
     vmin, vmax = v.min(axis=0), v.max(axis=0)
@@ -354,17 +383,18 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale, pre_norm=pre_norm)
 
 
 def texture_multipart_multiview(pipe, parts, merged,
                                 front_image, back_image=None,
                                 left_image=None, right_image=None,
                                 seed=42, resolution=1024, texture_size=2048,
-                                front_axis='z', blend_temperature=2.0):
+                                front_axis='z', blend_temperature=2.0,
+                                pre_norm=None):
     """Multi-view version of texture_multipart."""
     logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
-                f"merged={len(merged.faces)} faces")
+                f"merged={len(merged.faces)} faces, pre_norm={pre_norm is not None}")
 
     v = merged.vertices
     vmin, vmax = v.min(axis=0), v.max(axis=0)
@@ -380,7 +410,7 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale, pre_norm=pre_norm)
 
 
 # =============================================================================
@@ -553,7 +583,7 @@ async def texture_mesh(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        parts, merged, is_multipart = load_glb_parts(mesh_path)
+        parts, merged, is_multipart, pre_norm = load_glb_parts(mesh_path)
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
@@ -565,6 +595,7 @@ async def texture_mesh(
                     result = texture_multipart(
                         tex_pipeline, parts, merged, image,
                         seed=seed, resolution=resolution, texture_size=texture_size,
+                        pre_norm=pre_norm,
                     )
                 else:
                     result = tex_pipeline.run(
@@ -622,7 +653,7 @@ async def texture_mesh_multiview(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        parts, merged, is_multipart = load_glb_parts(mesh_path)
+        parts, merged, is_multipart, pre_norm = load_glb_parts(mesh_path)
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
@@ -637,6 +668,7 @@ async def texture_mesh_multiview(
                         left_image=left_img, right_image=right_img,
                         seed=seed, resolution=resolution, texture_size=texture_size,
                         front_axis=front_axis, blend_temperature=blend_temperature,
+                        pre_norm=pre_norm,
                     )
                 else:
                     result = tex_pipeline.run_multiview(
