@@ -353,6 +353,16 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
+    # Debug: save pipeline output as single mesh (no splitting) for comparison
+    if debug_dir:
+        try:
+            debug_single = textured.copy()
+            debug_single.vertices = debug_single.vertices / scale + center
+            debug_single.export(os.path.join(debug_dir, "debug_single.glb"))
+            logger.info("[DIAG] Wrote debug_single.glb (pipeline output, restored coords, no split)")
+        except Exception as e:
+            logger.warning(f"[DIAG] Failed to write debug_single: {e}")
+
     return _split_and_assemble(textured, parts, center, scale, debug_dir=debug_dir)
 
 
