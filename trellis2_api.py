@@ -301,11 +301,11 @@ def split_textured_mesh(textured, parts, center, scale):
 
 
 def _split_and_assemble(textured, parts, center, scale, debug_dir=None):
-    """Split textured mesh into parts and assemble Scene.
+    """Split textured mesh into parts, restore world coordinates, assemble Scene.
 
-    No coordinate restoration needed — pipeline output is in normalized space
-    ([-0.5, 0.5]) with correct relative positions since we merged first.
-    This matches the single-part pipeline output behavior.
+    Pipeline output is in normalized space [-0.5, 0.5]. We restore each part's
+    vertices to original world coordinates: v_world = v_normalized / scale + center.
+    This ensures the output GLB has the same coordinate system as the input.
 
     Returns a trimesh.Scene (multipart) or trimesh.Trimesh (fallback).
     """
@@ -315,33 +315,16 @@ def _split_and_assemble(textured, parts, center, scale, debug_dir=None):
         logger.warning("Split failed — returning single textured mesh")
         return textured
 
-    # === DIAGNOSTICS: trace vertex positions through split & assembly ===
-    tex_min = textured.vertices.min(0)
-    tex_max = textured.vertices.max(0)
-    logger.info(f"[DIAG] Textured mesh: {len(textured.vertices)} verts, "
-                f"bbox=[{tex_min.tolist()}, {tex_max.tolist()}]")
-
+    # Restore world coordinates: reverse the normalization
+    # Pipeline did: v_norm = (v_orig - center) * scale
+    # Restore:      v_orig = v_norm / scale + center
     for i, part in enumerate(result_parts):
+        part.vertices = part.vertices / scale + center
         p_min = part.vertices.min(0)
         p_max = part.vertices.max(0)
         p_center = (p_min + p_max) / 2
-        logger.info(f"[DIAG] Split part {i}: {len(part.vertices)} verts, {len(part.faces)} faces, "
+        logger.info(f"[DIAG] Restored part {i}: {len(part.vertices)} verts, {len(part.faces)} faces, "
                     f"bbox=[{p_min.tolist()}, {p_max.tolist()}], center={p_center.tolist()}")
-
-    concat = _trimesh.util.concatenate(result_parts)
-    c_min, c_max = concat.vertices.min(0), concat.vertices.max(0)
-    logger.info(f"[DIAG] Concatenated split parts: bbox=[{c_min.tolist()}, {c_max.tolist()}]")
-    bbox_ok = np.allclose([tex_min, tex_max], [c_min, c_max], atol=0.01)
-    logger.info(f"[DIAG] Split parts bbox matches textured mesh: {bbox_ok}")
-
-    # Write debug file: concatenated parts as single mesh (no Scene graph)
-    if debug_dir:
-        try:
-            debug_path = os.path.join(debug_dir, "debug_concat.glb")
-            concat.export(debug_path)
-            logger.info(f"[DIAG] Wrote debug concat mesh: {debug_path}")
-        except Exception as e:
-            logger.warning(f"[DIAG] Failed to write debug concat: {e}")
 
     scene = _trimesh.Scene()
     for i, part in enumerate(result_parts):
@@ -349,19 +332,6 @@ def _split_and_assemble(textured, parts, center, scale, debug_dir=None):
 
     if scene.bounds is not None:
         logger.info(f"[DIAG] Scene bounds: {scene.bounds.tolist()}")
-    else:
-        logger.warning(f"[DIAG] Scene bounds is None!")
-
-    # Verify: read back from Scene graph to check transforms
-    for node_name in scene.graph.nodes_geometry:
-        transform, geom_name = scene.graph[node_name]
-        is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        translation = transform[:3, 3]
-        geom = scene.geometry[geom_name]
-        g_min, g_max = geom.vertices.min(0), geom.vertices.max(0)
-        logger.info(f"[DIAG] Scene node '{node_name}': geom='{geom_name}', "
-                    f"identity_transform={is_identity}, translation={translation.tolist()}, "
-                    f"geom_bbox=[{g_min.tolist()}, {g_max.tolist()}]")
 
     return scene
 
