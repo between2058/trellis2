@@ -301,19 +301,16 @@ def split_textured_mesh(textured, parts, center, scale):
 
 
 def _split_and_assemble(textured, parts, center, scale):
-    """Split textured mesh into parts, assemble Scene with transform-based positioning.
+    """Split textured mesh into parts with a shared root transform.
 
-    GLB format uses float32 for vertices — large world coordinates (±100K+) cause
-    precision/rendering issues. Instead, we keep each part's vertices in local space
-    (centered at its own centroid) and use the Scene graph transform to position it
-    at the correct world location. This matches how most GLB files store multi-part
-    scenes (small local coords + node transform).
+    All part vertices stay in normalized space (small values, float32-safe).
+    A single shared transform restores world scale and position:
+      v_world = v_norm / scale + center
 
-    Flow:
-      1. Split textured mesh (normalized space) into per-part submeshes
-      2. Restore each part to world coordinates: v_world = v_norm / scale + center
-      3. Center each part at its own centroid (small local coords)
-      4. Add to Scene with centroid as translation transform
+    Because every part uses the SAME transform, any float32 precision loss
+    in the GLB is identical across parts — no relative misalignment.
+    (The previous per-part centroid approach failed because each part had a
+    different large centroid, causing different float32 rounding per part.)
     """
     result_parts = split_textured_mesh(textured, parts, center, scale)
 
@@ -321,20 +318,26 @@ def _split_and_assemble(textured, parts, center, scale):
         logger.warning("Split failed — returning single textured mesh")
         return textured
 
+    # Shared transform: v_world = v_norm * (1/scale) + center
+    inv_scale = 1.0 / scale
+    root_transform = np.eye(4)
+    root_transform[0, 0] = inv_scale
+    root_transform[1, 1] = inv_scale
+    root_transform[2, 2] = inv_scale
+    root_transform[:3, 3] = center
+
     scene = _trimesh.Scene()
     for i, part in enumerate(result_parts):
-        # Restore to world coordinates
-        part.vertices = part.vertices / scale + center
-        # Move to local space: vertices centered at centroid, transform holds position
-        centroid = (part.vertices.min(0) + part.vertices.max(0)) / 2
-        part.vertices -= centroid
-        transform = np.eye(4)
-        transform[:3, 3] = centroid
-        scene.add_geometry(part, node_name=f"part_{i}", transform=transform)
-        logger.debug(f"Part {i}: {len(part.faces)} faces, centroid={centroid.tolist()}")
+        # Vertices stay in normalized space — no coordinate restoration
+        scene.add_geometry(
+            part,
+            node_name=f"part_{i}",
+            geom_name=f"part_{i}_geom",
+            transform=root_transform,
+        )
 
-    logger.info(f"Assembled {len(result_parts)} parts, "
-                f"bounds={scene.bounds.tolist() if scene.bounds is not None else 'None'}")
+    logger.info(f"Assembled {len(result_parts)} parts with shared root transform "
+                f"(inv_scale={inv_scale:.2f}, center={center.tolist()})")
     return scene
 
 
