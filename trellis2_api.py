@@ -348,14 +348,29 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     center = (vmin + vmax) / 2
     scale = 0.99999 / (vmax - vmin).max()
 
-    # Debug: save merged mesh BEFORE pipeline (no normalization, no texturing)
+    # Debug: verify merged mesh vertex positions and export
     if debug_dir:
         try:
+            logger.info(f"[DIAG] Merged mesh in memory: {len(merged.vertices)} verts, "
+                        f"bbox=[{vmin.tolist()}, {vmax.tolist()}]")
+            logger.info(f"[DIAG] Merged first 3 verts: {merged.vertices[:3].tolist()}")
+            logger.info(f"[DIAG] Merged last 3 verts: {merged.vertices[-3:].tolist()}")
+            logger.info(f"[DIAG] Merged vertex dtype: {merged.vertices.dtype}")
+
+            # Export as GLB
             merged.export(os.path.join(debug_dir, "debug_merged.glb"))
-            logger.info(f"[DIAG] Wrote debug_merged.glb (merged input, {len(merged.vertices)} verts, "
-                        f"bbox=[{vmin.tolist()}, {vmax.tolist()}])")
+
+            # Readback GLB to check if export preserved coordinates
+            rb = _trimesh.load(os.path.join(debug_dir, "debug_merged.glb"), force='mesh', process=False)
+            logger.info(f"[DIAG] Readback debug_merged.glb: {len(rb.vertices)} verts, "
+                        f"bbox=[{rb.vertices.min(0).tolist()}, {rb.vertices.max(0).tolist()}]")
+            logger.info(f"[DIAG] Readback first 3 verts: {rb.vertices[:3].tolist()}")
+
+            # Also export as OBJ (text format, can verify manually)
+            merged.export(os.path.join(debug_dir, "debug_merged.obj"))
+            logger.info(f"[DIAG] Wrote debug_merged.obj for manual verification")
         except Exception as e:
-            logger.warning(f"[DIAG] Failed to write debug_merged: {e}")
+            logger.warning(f"[DIAG] debug_merged export failed: {e}")
 
     textured = pipe.run(merged, image, seed=seed,
                         resolution=resolution, texture_size=texture_size)
