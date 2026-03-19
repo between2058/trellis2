@@ -348,6 +348,15 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     center = (vmin + vmax) / 2
     scale = 0.99999 / (vmax - vmin).max()
 
+    # Debug: save merged mesh BEFORE pipeline (no normalization, no texturing)
+    if debug_dir:
+        try:
+            merged.export(os.path.join(debug_dir, "debug_merged.glb"))
+            logger.info(f"[DIAG] Wrote debug_merged.glb (merged input, {len(merged.vertices)} verts, "
+                        f"bbox=[{vmin.tolist()}, {vmax.tolist()}])")
+        except Exception as e:
+            logger.warning(f"[DIAG] Failed to write debug_merged: {e}")
+
     textured = pipe.run(merged, image, seed=seed,
                         resolution=resolution, texture_size=texture_size)
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
