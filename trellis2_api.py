@@ -137,43 +137,83 @@ def ensure_model_loaded():
 def load_glb_parts(path: str):
     """Load GLB and return (parts, merged_mesh, is_multipart).
 
-    Groups meshes by scene-graph node so that a single node with multiple
-    primitives stays as one part.  Each part gets its world transform baked in.
-    Parts with 0 faces are filtered out.
+    Uses force='mesh' as ground truth for the merged mesh (handles all GLB
+    structures correctly). Extracts individual parts from the scene graph
+    with world transforms baked in. If the parts don't match force='mesh',
+    falls back to single-mesh mode.
     """
     loaded = _trimesh.load(path, process=False)
 
     if isinstance(loaded, _trimesh.Trimesh):
         return [loaded], loaded, False
 
-    if isinstance(loaded, _trimesh.Scene):
-        node_meshes = {}
-        for node_name in loaded.graph.nodes_geometry:
-            transform, geom_name = loaded.graph[node_name]
-            geom = loaded.geometry[geom_name]
-            if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
-                continue
-            mesh = geom.copy().apply_transform(transform)
-            node_meshes.setdefault(node_name, []).append(mesh)
+    if not isinstance(loaded, _trimesh.Scene):
+        raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
-        if not node_meshes:
-            raise ValueError("No mesh geometry found in GLB")
+    # Ground truth: force='mesh' correctly handles ALL transform structures
+    merged_ref = _trimesh.load(path, force='mesh', process=False)
+    ref_bbox = merged_ref.bounds  # (2, 3) array: [min, max]
+    logger.info(f"force='mesh' reference: {len(merged_ref.vertices)} verts, "
+                f"bbox_range={ref_bbox[1] - ref_bbox[0]}")
 
-        parts = []
-        for meshes in node_meshes.values():
-            part = meshes[0] if len(meshes) == 1 else _trimesh.util.concatenate(meshes)
-            if len(part.faces) > 0:
-                parts.append(part)
+    # Extract parts with world transforms from scene graph
+    node_meshes = {}
+    for node_name in loaded.graph.nodes_geometry:
+        transform, geom_name = loaded.graph[node_name]
+        geom = loaded.geometry[geom_name]
+        if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
+            continue
 
+        local_center = (geom.bounds[0] + geom.bounds[1]) / 2
+        translation = transform[:3, 3]
+        is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
+        logger.debug(f"  Node '{node_name}': local_center={local_center.tolist()}, "
+                     f"translation={translation.tolist()}, identity={is_identity}")
+
+        mesh = geom.copy().apply_transform(transform)
+        node_meshes.setdefault(node_name, []).append(mesh)
+
+    if not node_meshes:
+        return [merged_ref], merged_ref, False
+
+    parts = []
+    for meshes in node_meshes.values():
+        part = meshes[0] if len(meshes) == 1 else _trimesh.util.concatenate(meshes)
+        if len(part.faces) > 0:
+            parts.append(part)
+
+    if len(parts) <= 1:
+        return [merged_ref], merged_ref, False
+
+    # Verify: our concatenated parts should match force='mesh' bounding box
+    concat = _trimesh.util.concatenate(parts)
+    concat_bbox = concat.bounds
+    bbox_match = np.allclose(ref_bbox, concat_bbox, atol=0.01)
+    logger.info(f"Extracted {len(parts)} parts, concat {len(concat.vertices)} verts, "
+                f"bbox_range={concat_bbox[1] - concat_bbox[0]}, "
+                f"match_ref={bbox_match}")
+
+    if not bbox_match:
+        logger.warning(
+            f"Part extraction bbox mismatch! "
+            f"ref={ref_bbox.tolist()} vs ours={concat_bbox.tolist()}. "
+            f"Retrying with scene.dump()..."
+        )
+        # scene.dump applies transforms the same way force='mesh' does internally
+        dumped = loaded.dump(concatenate=False)
+        parts = [m for m in dumped
+                 if isinstance(m, _trimesh.Trimesh) and len(m.faces) > 0]
         if len(parts) <= 1:
-            single = parts[0] if parts else None
-            return parts, single, False
+            return [merged_ref], merged_ref, False
+        concat2 = _trimesh.util.concatenate(parts)
+        bbox_match2 = np.allclose(ref_bbox, concat2.bounds, atol=0.01)
+        logger.info(f"scene.dump() gave {len(parts)} parts, match_ref={bbox_match2}")
+        if not bbox_match2:
+            logger.warning("Still mismatched — falling back to single mesh")
+            return [merged_ref], merged_ref, False
 
-        merged = _trimesh.util.concatenate(parts)
-        logger.info(f"Loaded {len(parts)} parts, merged: {len(merged.vertices)} verts, {len(merged.faces)} faces")
-        return parts, merged, True
-
-    raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
+    # Always use force='mesh' for the pipeline input (guaranteed correct)
+    return parts, merged_ref, True
 
 
 def _extract_submesh(textured, face_mask):
