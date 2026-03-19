@@ -340,21 +340,21 @@ def _split_and_assemble(textured, parts, center, scale):
 
 def texture_multipart(pipe, parts, merged, image, seed=42,
                       resolution=1024, texture_size=2048):
-    """Texture multi-part GLB: emulates Blender Join → single textured mesh.
-
-    All parts are merged into one mesh (already done by load_glb_parts via
-    force='mesh'). Pipeline textures the whole scene at once. Output is a
-    single mesh — no split/reassemble, no transforms.
-    """
-    logger.info(f"Multipart texture (join mode): {len(parts)} parts, "
+    """Texture multi-part GLB: merge → run pipeline once → split."""
+    logger.info(f"Multipart texture: {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
+
+    v = merged.vertices
+    vmin, vmax = v.min(axis=0), v.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
 
     textured = pipe.run(merged, image, seed=seed,
                         resolution=resolution, texture_size=texture_size)
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return textured
+    return _split_and_assemble(textured, parts, center, scale)
 
 
 def texture_multipart_multiview(pipe, parts, merged,
@@ -362,9 +362,14 @@ def texture_multipart_multiview(pipe, parts, merged,
                                 left_image=None, right_image=None,
                                 seed=42, resolution=1024, texture_size=2048,
                                 front_axis='z', blend_temperature=2.0):
-    """Multi-view version of texture_multipart (join mode)."""
-    logger.info(f"Multipart texture (multiview, join mode): {len(parts)} parts, "
+    """Multi-view version of texture_multipart."""
+    logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
+
+    v = merged.vertices
+    vmin, vmax = v.min(axis=0), v.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
 
     textured = pipe.run_multiview(
         merged, front_image=front_image, back_image=back_image,
@@ -375,7 +380,7 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return textured
+    return _split_and_assemble(textured, parts, center, scale)
 
 
 # =============================================================================
