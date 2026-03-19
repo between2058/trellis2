@@ -300,7 +300,7 @@ def split_textured_mesh(textured, parts, center, scale):
     return result if len(result) > 0 else None
 
 
-def _split_and_assemble(textured, parts, center, scale):
+def _split_and_assemble(textured, parts, center, scale, debug_dir=None):
     """Split textured mesh into parts and assemble Scene.
 
     No coordinate restoration needed — pipeline output is in normalized space
@@ -315,14 +315,59 @@ def _split_and_assemble(textured, parts, center, scale):
         logger.warning("Split failed — returning single textured mesh")
         return textured
 
+    # === DIAGNOSTICS: trace vertex positions through split & assembly ===
+    tex_min = textured.vertices.min(0)
+    tex_max = textured.vertices.max(0)
+    logger.info(f"[DIAG] Textured mesh: {len(textured.vertices)} verts, "
+                f"bbox=[{tex_min.tolist()}, {tex_max.tolist()}]")
+
+    for i, part in enumerate(result_parts):
+        p_min = part.vertices.min(0)
+        p_max = part.vertices.max(0)
+        p_center = (p_min + p_max) / 2
+        logger.info(f"[DIAG] Split part {i}: {len(part.vertices)} verts, {len(part.faces)} faces, "
+                    f"bbox=[{p_min.tolist()}, {p_max.tolist()}], center={p_center.tolist()}")
+
+    concat = _trimesh.util.concatenate(result_parts)
+    c_min, c_max = concat.vertices.min(0), concat.vertices.max(0)
+    logger.info(f"[DIAG] Concatenated split parts: bbox=[{c_min.tolist()}, {c_max.tolist()}]")
+    bbox_ok = np.allclose([tex_min, tex_max], [c_min, c_max], atol=0.01)
+    logger.info(f"[DIAG] Split parts bbox matches textured mesh: {bbox_ok}")
+
+    # Write debug file: concatenated parts as single mesh (no Scene graph)
+    if debug_dir:
+        try:
+            debug_path = os.path.join(debug_dir, "debug_concat.glb")
+            concat.export(debug_path)
+            logger.info(f"[DIAG] Wrote debug concat mesh: {debug_path}")
+        except Exception as e:
+            logger.warning(f"[DIAG] Failed to write debug concat: {e}")
+
     scene = _trimesh.Scene()
     for i, part in enumerate(result_parts):
         scene.add_geometry(part, node_name=f"part_{i}")
+
+    if scene.bounds is not None:
+        logger.info(f"[DIAG] Scene bounds: {scene.bounds.tolist()}")
+    else:
+        logger.warning(f"[DIAG] Scene bounds is None!")
+
+    # Verify: read back from Scene graph to check transforms
+    for node_name in scene.graph.nodes_geometry:
+        transform, geom_name = scene.graph[node_name]
+        is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
+        translation = transform[:3, 3]
+        geom = scene.geometry[geom_name]
+        g_min, g_max = geom.vertices.min(0), geom.vertices.max(0)
+        logger.info(f"[DIAG] Scene node '{node_name}': geom='{geom_name}', "
+                    f"identity_transform={is_identity}, translation={translation.tolist()}, "
+                    f"geom_bbox=[{g_min.tolist()}, {g_max.tolist()}]")
+
     return scene
 
 
 def texture_multipart(pipe, parts, merged, image, seed=42,
-                      resolution=1024, texture_size=2048):
+                      resolution=1024, texture_size=2048, debug_dir=None):
     """Texture multi-part GLB: merge → run pipeline once → split."""
     logger.info(f"Multipart texture: {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
@@ -338,14 +383,15 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale, debug_dir=debug_dir)
 
 
 def texture_multipart_multiview(pipe, parts, merged,
                                 front_image, back_image=None,
                                 left_image=None, right_image=None,
                                 seed=42, resolution=1024, texture_size=2048,
-                                front_axis='z', blend_temperature=2.0):
+                                front_axis='z', blend_temperature=2.0,
+                                debug_dir=None):
     """Multi-view version of texture_multipart."""
     logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
@@ -364,7 +410,7 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale, debug_dir=debug_dir)
 
 
 # =============================================================================
@@ -549,6 +595,7 @@ async def texture_mesh(
                     result = texture_multipart(
                         tex_pipeline, parts, merged, image,
                         seed=seed, resolution=resolution, texture_size=texture_size,
+                        debug_dir=req_dir,
                     )
                 else:
                     result = tex_pipeline.run(
@@ -556,6 +603,27 @@ async def texture_mesh(
                         resolution=resolution, texture_size=texture_size,
                     )
                 result.export(out_path)
+
+                # Read back exported GLB to verify part positions
+                if is_multipart:
+                    try:
+                        readback = _trimesh.load(out_path, process=False)
+                        if isinstance(readback, _trimesh.Scene):
+                            for nn in readback.graph.nodes_geometry:
+                                tf, gn = readback.graph[nn]
+                                g = readback.geometry[gn]
+                                rb_min, rb_max = g.vertices.min(0), g.vertices.max(0)
+                                rb_t = tf[:3, 3]
+                                logger.info(f"[DIAG] Readback node '{nn}': "
+                                            f"geom_bbox=[{rb_min.tolist()}, {rb_max.tolist()}], "
+                                            f"translation={rb_t.tolist()}")
+                        else:
+                            logger.info(f"[DIAG] Readback is single Trimesh, "
+                                        f"bbox=[{readback.vertices.min(0).tolist()}, "
+                                        f"{readback.vertices.max(0).tolist()}]")
+                    except Exception as e:
+                        logger.warning(f"[DIAG] Readback failed: {e}")
+
                 return out_path
 
             out_path = await run_in_threadpool(_run)
@@ -565,6 +633,7 @@ async def texture_mesh(
         return {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
+            "debug_concat_url": f"/download/{request_id}/debug_concat.glb" if is_multipart else None,
         }
     except Exception as e:
         logger.error(f"Texture failed: {e}", exc_info=True)
@@ -621,6 +690,7 @@ async def texture_mesh_multiview(
                         left_image=left_img, right_image=right_img,
                         seed=seed, resolution=resolution, texture_size=texture_size,
                         front_axis=front_axis, blend_temperature=blend_temperature,
+                        debug_dir=req_dir,
                     )
                 else:
                     result = tex_pipeline.run_multiview(
