@@ -300,14 +300,20 @@ def split_textured_mesh(textured, parts, center, scale):
     return result if len(result) > 0 else None
 
 
-def _split_and_assemble(textured, parts, center, scale, debug_dir=None):
-    """Split textured mesh into parts, restore world coordinates, assemble Scene.
+def _split_and_assemble(textured, parts, center, scale):
+    """Split textured mesh into parts, assemble Scene with transform-based positioning.
 
-    Pipeline output is in normalized space [-0.5, 0.5]. We restore each part's
-    vertices to original world coordinates: v_world = v_normalized / scale + center.
-    This ensures the output GLB has the same coordinate system as the input.
+    GLB format uses float32 for vertices — large world coordinates (±100K+) cause
+    precision/rendering issues. Instead, we keep each part's vertices in local space
+    (centered at its own centroid) and use the Scene graph transform to position it
+    at the correct world location. This matches how most GLB files store multi-part
+    scenes (small local coords + node transform).
 
-    Returns a trimesh.Scene (multipart) or trimesh.Trimesh (fallback).
+    Flow:
+      1. Split textured mesh (normalized space) into per-part submeshes
+      2. Restore each part to world coordinates: v_world = v_norm / scale + center
+      3. Center each part at its own centroid (small local coords)
+      4. Add to Scene with centroid as translation transform
     """
     result_parts = split_textured_mesh(textured, parts, center, scale)
 
@@ -315,87 +321,47 @@ def _split_and_assemble(textured, parts, center, scale, debug_dir=None):
         logger.warning("Split failed — returning single textured mesh")
         return textured
 
-    # Restore world coordinates: reverse the normalization
-    # Pipeline did: v_norm = (v_orig - center) * scale
-    # Restore:      v_orig = v_norm / scale + center
-    for i, part in enumerate(result_parts):
-        part.vertices = part.vertices / scale + center
-        p_min = part.vertices.min(0)
-        p_max = part.vertices.max(0)
-        p_center = (p_min + p_max) / 2
-        logger.info(f"[DIAG] Restored part {i}: {len(part.vertices)} verts, {len(part.faces)} faces, "
-                    f"bbox=[{p_min.tolist()}, {p_max.tolist()}], center={p_center.tolist()}")
-
     scene = _trimesh.Scene()
     for i, part in enumerate(result_parts):
-        scene.add_geometry(part, node_name=f"part_{i}")
+        # Restore to world coordinates
+        part.vertices = part.vertices / scale + center
+        # Move to local space: vertices centered at centroid, transform holds position
+        centroid = (part.vertices.min(0) + part.vertices.max(0)) / 2
+        part.vertices -= centroid
+        transform = np.eye(4)
+        transform[:3, 3] = centroid
+        scene.add_geometry(part, node_name=f"part_{i}", transform=transform)
+        logger.debug(f"Part {i}: {len(part.faces)} faces, centroid={centroid.tolist()}")
 
-    if scene.bounds is not None:
-        logger.info(f"[DIAG] Scene bounds: {scene.bounds.tolist()}")
-
+    logger.info(f"Assembled {len(result_parts)} parts, "
+                f"bounds={scene.bounds.tolist() if scene.bounds is not None else 'None'}")
     return scene
 
 
 def texture_multipart(pipe, parts, merged, image, seed=42,
-                      resolution=1024, texture_size=2048, debug_dir=None):
+                      resolution=1024, texture_size=2048):
     """Texture multi-part GLB: merge → run pipeline once → split."""
     logger.info(f"Multipart texture: {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
 
-    # center/scale needed for KD-tree matching (not for coord restoration)
     v = merged.vertices
     vmin, vmax = v.min(axis=0), v.max(axis=0)
     center = (vmin + vmax) / 2
     scale = 0.99999 / (vmax - vmin).max()
-
-    # Debug: verify merged mesh vertex positions and export
-    if debug_dir:
-        try:
-            logger.info(f"[DIAG] Merged mesh in memory: {len(merged.vertices)} verts, "
-                        f"bbox=[{vmin.tolist()}, {vmax.tolist()}]")
-            logger.info(f"[DIAG] Merged first 3 verts: {merged.vertices[:3].tolist()}")
-            logger.info(f"[DIAG] Merged last 3 verts: {merged.vertices[-3:].tolist()}")
-            logger.info(f"[DIAG] Merged vertex dtype: {merged.vertices.dtype}")
-
-            # Export as GLB
-            merged.export(os.path.join(debug_dir, "debug_merged.glb"))
-
-            # Readback GLB to check if export preserved coordinates
-            rb = _trimesh.load(os.path.join(debug_dir, "debug_merged.glb"), force='mesh', process=False)
-            logger.info(f"[DIAG] Readback debug_merged.glb: {len(rb.vertices)} verts, "
-                        f"bbox=[{rb.vertices.min(0).tolist()}, {rb.vertices.max(0).tolist()}]")
-            logger.info(f"[DIAG] Readback first 3 verts: {rb.vertices[:3].tolist()}")
-
-            # Also export as OBJ (text format, can verify manually)
-            merged.export(os.path.join(debug_dir, "debug_merged.obj"))
-            logger.info(f"[DIAG] Wrote debug_merged.obj for manual verification")
-        except Exception as e:
-            logger.warning(f"[DIAG] debug_merged export failed: {e}")
 
     textured = pipe.run(merged, image, seed=seed,
                         resolution=resolution, texture_size=texture_size)
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    # Debug: save pipeline output as single mesh (no splitting) for comparison
-    if debug_dir:
-        try:
-            debug_single = textured.copy()
-            debug_single.vertices = debug_single.vertices / scale + center
-            debug_single.export(os.path.join(debug_dir, "debug_single.glb"))
-            logger.info("[DIAG] Wrote debug_single.glb (pipeline output, restored coords, no split)")
-        except Exception as e:
-            logger.warning(f"[DIAG] Failed to write debug_single: {e}")
-
-    return _split_and_assemble(textured, parts, center, scale, debug_dir=debug_dir)
+    return _split_and_assemble(textured, parts, center, scale)
 
 
 def texture_multipart_multiview(pipe, parts, merged,
                                 front_image, back_image=None,
                                 left_image=None, right_image=None,
                                 seed=42, resolution=1024, texture_size=2048,
-                                front_axis='z', blend_temperature=2.0,
-                                debug_dir=None):
+                                front_axis='z', blend_temperature=2.0):
     """Multi-view version of texture_multipart."""
     logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
@@ -414,7 +380,7 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale, debug_dir=debug_dir)
+    return _split_and_assemble(textured, parts, center, scale)
 
 
 # =============================================================================
@@ -599,7 +565,6 @@ async def texture_mesh(
                     result = texture_multipart(
                         tex_pipeline, parts, merged, image,
                         seed=seed, resolution=resolution, texture_size=texture_size,
-                        debug_dir=req_dir,
                     )
                 else:
                     result = tex_pipeline.run(
@@ -607,27 +572,6 @@ async def texture_mesh(
                         resolution=resolution, texture_size=texture_size,
                     )
                 result.export(out_path)
-
-                # Read back exported GLB to verify part positions
-                if is_multipart:
-                    try:
-                        readback = _trimesh.load(out_path, process=False)
-                        if isinstance(readback, _trimesh.Scene):
-                            for nn in readback.graph.nodes_geometry:
-                                tf, gn = readback.graph[nn]
-                                g = readback.geometry[gn]
-                                rb_min, rb_max = g.vertices.min(0), g.vertices.max(0)
-                                rb_t = tf[:3, 3]
-                                logger.info(f"[DIAG] Readback node '{nn}': "
-                                            f"geom_bbox=[{rb_min.tolist()}, {rb_max.tolist()}], "
-                                            f"translation={rb_t.tolist()}")
-                        else:
-                            logger.info(f"[DIAG] Readback is single Trimesh, "
-                                        f"bbox=[{readback.vertices.min(0).tolist()}, "
-                                        f"{readback.vertices.max(0).tolist()}]")
-                    except Exception as e:
-                        logger.warning(f"[DIAG] Readback failed: {e}")
-
                 return out_path
 
             out_path = await run_in_threadpool(_run)
@@ -637,7 +581,6 @@ async def texture_mesh(
         return {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
-            "debug_concat_url": f"/download/{request_id}/debug_concat.glb" if is_multipart else None,
         }
     except Exception as e:
         logger.error(f"Texture failed: {e}", exc_info=True)
@@ -694,7 +637,6 @@ async def texture_mesh_multiview(
                         left_image=left_img, right_image=right_img,
                         seed=seed, resolution=resolution, texture_size=texture_size,
                         front_axis=front_axis, blend_temperature=blend_temperature,
-                        debug_dir=req_dir,
                     )
                 else:
                     result = tex_pipeline.run_multiview(
