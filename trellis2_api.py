@@ -85,7 +85,7 @@ tex_pipeline = None
 gpu_lock = asyncio.Lock()
 
 
-def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000000):
+def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000000, remesh=True):
     """Convert MeshWithVoxel to GLB via o_voxel.postprocess."""
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
@@ -97,7 +97,7 @@ def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=decimation_target,
         texture_size=texture_size,
-        remesh=True,
+        remesh=remesh,
         remesh_band=1,
         remesh_project=0,
         verbose=True,
@@ -406,6 +406,8 @@ async def generate(
     slat_guidance_strength: float = Form(3.0),
     slat_sampling_steps: int = Form(12),
     texture_size: int = Form(1024),
+    decimation_target: int = Form(1000000),
+    remesh: bool = Form(True),
 ):
     """Single image to 3D mesh."""
     try:
@@ -438,7 +440,8 @@ async def generate(
                 )
                 mesh = results[0]
                 glb_path = os.path.join(req_dir, "output.glb")
-                export_mesh_to_glb(mesh, glb_path, texture_size=texture_size)
+                export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
+                                   decimation_target=decimation_target, remesh=remesh)
                 return glb_path
 
             glb_path = await run_in_threadpool(_run)
@@ -469,6 +472,9 @@ async def generate_multiview(
     front_axis: str = Form("z"),
     blend_temperature: float = Form(2.0),
     sampler: str = Form("euler"),
+    texture_size: int = Form(1024),
+    decimation_target: int = Form(1000000),
+    remesh: bool = Form(True),
 ):
     """Multi-view images to 3D mesh."""
     try:
@@ -515,7 +521,8 @@ async def generate_multiview(
                 )
                 mesh = results[0]
                 glb_path = os.path.join(req_dir, "output.glb")
-                export_mesh_to_glb(mesh, glb_path)
+                export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
+                                   decimation_target=decimation_target, remesh=remesh)
                 return glb_path
 
             glb_path = await run_in_threadpool(_run)
