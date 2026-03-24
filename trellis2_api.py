@@ -314,15 +314,9 @@ def _split_and_assemble(textured, parts, center, scale, part_transforms=None):
         # Step 1: restore to world coordinates (float64)
         world_v = part.vertices.astype(np.float64) / scale + center
 
-        use_original_transform = False
         if part_transforms is not None and orig_idx < len(part_transforms):
-            T = part_transforms[orig_idx]
-            det = np.linalg.det(T)
-            if abs(det) > 1e-10:
-                use_original_transform = True
-
-        if use_original_transform:
             # Step 2: convert to original local space using inverse transform
+            T = part_transforms[orig_idx]
             inv_T = np.linalg.inv(T)
             ones = np.ones((len(world_v), 1), dtype=np.float64)
             homo = np.hstack([world_v, ones])
@@ -330,7 +324,7 @@ def _split_and_assemble(textured, parts, center, scale, part_transforms=None):
             part.vertices = local_v.astype(np.float32)
             transform = T
         else:
-            # Fallback: centroid approach (singular or missing transform)
+            # Fallback: centroid approach (for identity-transform GLBs)
             part.vertices = world_v.astype(np.float32)
             centroid = (part.vertices.min(0) + part.vertices.max(0)) / 2
             part.vertices -= centroid
