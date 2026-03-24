@@ -1,6 +1,5 @@
 import os
 import shutil
-import subprocess
 import tempfile
 import uuid
 import gc
@@ -135,32 +134,6 @@ def ensure_model_loaded():
 # Multi-part GLB helpers
 # =============================================================================
 
-_BLENDER_JOIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_blender_join.py')
-
-
-def blender_join_glb(input_path: str, output_path: str) -> bool:
-    """Join all mesh objects in a GLB using Blender headless (replicates Ctrl+A → Ctrl+J)."""
-    try:
-        result = subprocess.run(
-            ['blender', '-b', '--python', _BLENDER_JOIN_SCRIPT, '--', input_path, output_path],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            logger.error(f"Blender join failed (rc={result.returncode}): {result.stderr[-500:]}")
-            return False
-        if not os.path.exists(output_path):
-            logger.error("Blender join produced no output file")
-            return False
-        logger.info(f"Blender join OK: {input_path} -> {output_path}")
-        return True
-    except FileNotFoundError:
-        logger.error("Blender not found in PATH. Install Blender for auto-join support.")
-        return False
-    except subprocess.TimeoutExpired:
-        logger.error("Blender join timed out (120s)")
-        return False
-
-
 def load_glb_parts(path: str):
     """Load GLB and return (parts, merged_mesh, is_multipart).
 
@@ -185,18 +158,17 @@ def load_glb_parts(path: str):
 
     # Extract parts with world transforms from scene graph
     node_meshes = {}
-    has_non_identity = False
     for node_name in loaded.graph.nodes_geometry:
         transform, geom_name = loaded.graph[node_name]
         geom = loaded.geometry[geom_name]
         if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
             continue
 
+        local_center = (geom.bounds[0] + geom.bounds[1]) / 2
+        translation = transform[:3, 3]
         is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        if not is_identity:
-            has_non_identity = True
-        logger.debug(f"  Node '{node_name}': identity={is_identity}, "
-                     f"translation={transform[:3, 3].tolist()}")
+        logger.debug(f"  Node '{node_name}': local_center={local_center.tolist()}, "
+                     f"translation={translation.tolist()}, identity={is_identity}")
 
         mesh = geom.copy().apply_transform(transform)
         node_meshes.setdefault(node_name, []).append(mesh)
@@ -212,24 +184,6 @@ def load_glb_parts(path: str):
 
     if len(parts) <= 1:
         return [merged_ref], merged_ref, False
-
-    # Flat multi-part with non-identity transforms: use Blender headless to join
-    # (replicates the manual Blender Join workflow that produces correct results)
-    if has_non_identity:
-        logger.info(f"Flat multi-part GLB ({len(parts)} parts with transforms) — attempting Blender join")
-        joined_path = path + '.joined.glb'
-        if blender_join_glb(path, joined_path):
-            joined_mesh = _trimesh.load(joined_path, force='mesh', process=False)
-            try:
-                os.unlink(joined_path)
-            except OSError:
-                pass
-            logger.info(f"Blender join: {len(parts)} parts -> single mesh "
-                        f"({len(joined_mesh.vertices)} verts, {len(joined_mesh.faces)} faces)")
-            return [joined_mesh], joined_mesh, False
-        else:
-            logger.warning("Blender join unavailable, falling back to trimesh force='mesh'")
-            return [merged_ref], merged_ref, False
 
     # Verify: our concatenated parts should match force='mesh' bounding box
     concat = _trimesh.util.concatenate(parts)
