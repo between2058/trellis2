@@ -135,55 +135,51 @@ def ensure_model_loaded():
 # =============================================================================
 
 def load_glb_parts(path: str):
-    """Load GLB and return (parts, merged_mesh, is_multipart).
+    """Load GLB and return (parts, merged_mesh, is_multipart, part_transforms).
 
-    Uses force='mesh' as ground truth for the merged mesh (handles all GLB
-    structures correctly). Extracts individual parts from the scene graph
-    with world transforms baked in. If the parts don't match force='mesh',
-    falls back to single-mesh mode.
+    Extracts individual parts from the scene graph with world transforms
+    baked into vertices. Also preserves the original per-part transforms
+    so the output can reconstruct the same local-coords + transform structure
+    as the input GLB.
     """
     loaded = _trimesh.load(path, process=False)
 
     if isinstance(loaded, _trimesh.Trimesh):
-        return [loaded], loaded, False
+        return [loaded], loaded, False, None
 
     if not isinstance(loaded, _trimesh.Scene):
         raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
-    # Ground truth: force='mesh' correctly handles ALL transform structures
     merged_ref = _trimesh.load(path, force='mesh', process=False)
-    ref_bbox = merged_ref.bounds  # (2, 3) array: [min, max]
+    ref_bbox = merged_ref.bounds
     logger.info(f"force='mesh' reference: {len(merged_ref.vertices)} verts, "
                 f"bbox_range={ref_bbox[1] - ref_bbox[0]}")
 
-    # Extract parts with world transforms from scene graph
+    # Extract parts with world transforms; keep original transforms for output
     node_meshes = {}
+    node_transforms = {}
     for node_name in loaded.graph.nodes_geometry:
         transform, geom_name = loaded.graph[node_name]
         geom = loaded.geometry[geom_name]
         if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
             continue
-
-        local_center = (geom.bounds[0] + geom.bounds[1]) / 2
-        translation = transform[:3, 3]
-        is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        logger.debug(f"  Node '{node_name}': local_center={local_center.tolist()}, "
-                     f"translation={translation.tolist()}, identity={is_identity}")
-
         mesh = geom.copy().apply_transform(transform)
         node_meshes.setdefault(node_name, []).append(mesh)
+        node_transforms[node_name] = transform.copy()
 
     if not node_meshes:
-        return [merged_ref], merged_ref, False
+        return [merged_ref], merged_ref, False, None
 
     parts = []
-    for meshes in node_meshes.values():
+    part_transforms = []
+    for node_name, meshes in node_meshes.items():
         part = meshes[0] if len(meshes) == 1 else _trimesh.util.concatenate(meshes)
         if len(part.faces) > 0:
             parts.append(part)
+            part_transforms.append(node_transforms[node_name])
 
     if len(parts) <= 1:
-        return [merged_ref], merged_ref, False
+        return [merged_ref], merged_ref, False, None
 
     # Verify: our concatenated parts should match force='mesh' bounding box
     concat = _trimesh.util.concatenate(parts)
@@ -194,26 +190,21 @@ def load_glb_parts(path: str):
                 f"match_ref={bbox_match}")
 
     if not bbox_match:
-        logger.warning(
-            f"Part extraction bbox mismatch! "
-            f"ref={ref_bbox.tolist()} vs ours={concat_bbox.tolist()}. "
-            f"Retrying with scene.dump()..."
-        )
-        # scene.dump applies transforms the same way force='mesh' does internally
+        logger.warning(f"Part extraction bbox mismatch! Retrying with scene.dump()...")
         dumped = loaded.dump(concatenate=False)
         parts = [m for m in dumped
                  if isinstance(m, _trimesh.Trimesh) and len(m.faces) > 0]
         if len(parts) <= 1:
-            return [merged_ref], merged_ref, False
+            return [merged_ref], merged_ref, False, None
         concat2 = _trimesh.util.concatenate(parts)
         bbox_match2 = np.allclose(ref_bbox, concat2.bounds, atol=0.01)
         logger.info(f"scene.dump() gave {len(parts)} parts, match_ref={bbox_match2}")
         if not bbox_match2:
             logger.warning("Still mismatched — falling back to single mesh")
-            return [merged_ref], merged_ref, False
+            return [merged_ref], merged_ref, False, None
+        part_transforms = None  # dump fallback: transforms already baked in
 
-    # Always use force='mesh' for the pipeline input (guaranteed correct)
-    return parts, merged_ref, True
+    return parts, merged_ref, True, part_transforms
 
 
 def _extract_submesh(textured, face_mask):
@@ -295,54 +286,66 @@ def split_textured_mesh(textured, parts, center, scale):
         logger.info(f"Part {i}: {n_faces} faces (original {len(parts[i].faces)})")
         sub = _extract_submesh(textured, mask)
         if sub is not None:
-            result.append(sub)
+            result.append((i, sub))  # (original_part_index, submesh)
 
     return result if len(result) > 0 else None
 
 
-def _split_and_assemble(textured, parts, center, scale):
-    """Split textured mesh into parts, assemble Scene with transform-based positioning.
+def _split_and_assemble(textured, parts, center, scale, part_transforms=None):
+    """Split textured mesh into parts, restore each to its original local space.
 
-    GLB format uses float32 for vertices — large world coordinates (±100K+) cause
-    precision/rendering issues. Instead, we keep each part's vertices in local space
-    (centered at its own centroid) and use the Scene graph transform to position it
-    at the correct world location. This matches how most GLB files store multi-part
-    scenes (small local coords + node transform).
+    Uses the original per-part transforms from the input GLB to convert
+    textured vertices back to each part's local coordinate system:
+      1. v_world = v_norm / scale + center  (restore world coordinates, float64)
+      2. v_local = inv(T_i) @ v_world       (back to part's local space, float64)
+      3. Export with original T_i            (same structure as input GLB)
 
-    Flow:
-      1. Split textured mesh (normalized space) into per-part submeshes
-      2. Restore each part to world coordinates: v_world = v_norm / scale + center
-      3. Center each part at its own centroid (small local coords)
-      4. Add to Scene with centroid as translation transform
+    Local coordinates are small (near origin) → float32-safe.
+    Original transforms were already float32 in the input GLB → safe to reuse.
     """
-    result_parts = split_textured_mesh(textured, parts, center, scale)
+    split_result = split_textured_mesh(textured, parts, center, scale)
 
-    if result_parts is None:
+    if split_result is None:
         logger.warning("Split failed — returning single textured mesh")
         return textured
 
     scene = _trimesh.Scene()
-    for i, part in enumerate(result_parts):
-        # Restore to world coordinates
-        part.vertices = part.vertices / scale + center
-        # Move to local space: vertices centered at centroid, transform holds position
-        centroid = (part.vertices.min(0) + part.vertices.max(0)) / 2
-        part.vertices -= centroid
-        transform = np.eye(4)
-        transform[:3, 3] = centroid
-        scene.add_geometry(part, node_name=f"part_{i}", transform=transform)
-        logger.debug(f"Part {i}: {len(part.faces)} faces, centroid={centroid.tolist()}")
+    for orig_idx, part in split_result:
+        # Step 1: restore to world coordinates (float64)
+        world_v = part.vertices.astype(np.float64) / scale + center
 
-    logger.info(f"Assembled {len(result_parts)} parts, "
+        if part_transforms is not None and orig_idx < len(part_transforms):
+            # Step 2: convert to original local space using inverse transform
+            T = part_transforms[orig_idx]
+            inv_T = np.linalg.inv(T)
+            ones = np.ones((len(world_v), 1), dtype=np.float64)
+            homo = np.hstack([world_v, ones])
+            local_v = (inv_T @ homo.T).T[:, :3]
+            part.vertices = local_v.astype(np.float32)
+            transform = T
+        else:
+            # Fallback: centroid approach (for identity-transform GLBs)
+            part.vertices = world_v.astype(np.float32)
+            centroid = (part.vertices.min(0) + part.vertices.max(0)) / 2
+            part.vertices -= centroid
+            transform = np.eye(4)
+            transform[:3, 3] = centroid
+
+        scene.add_geometry(part, node_name=f"part_{orig_idx}",
+                           geom_name=f"part_{orig_idx}_geom",
+                           transform=transform)
+
+    logger.info(f"Assembled {len(split_result)} parts, "
                 f"bounds={scene.bounds.tolist() if scene.bounds is not None else 'None'}")
     return scene
 
 
 def texture_multipart(pipe, parts, merged, image, seed=42,
-                      resolution=1024, texture_size=2048):
-    """Texture multi-part GLB: merge → run pipeline once → split."""
+                      resolution=1024, texture_size=2048, part_transforms=None):
+    """Texture multi-part GLB: merge → run pipeline once → split → restore local coords."""
     logger.info(f"Multipart texture: {len(parts)} parts, "
-                f"merged={len(merged.faces)} faces")
+                f"merged={len(merged.faces)} faces, "
+                f"has_transforms={part_transforms is not None}")
 
     v = merged.vertices
     vmin, vmax = v.min(axis=0), v.max(axis=0)
@@ -354,17 +357,19 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale, part_transforms)
 
 
 def texture_multipart_multiview(pipe, parts, merged,
                                 front_image, back_image=None,
                                 left_image=None, right_image=None,
                                 seed=42, resolution=1024, texture_size=2048,
-                                front_axis='z', blend_temperature=2.0):
+                                front_axis='z', blend_temperature=2.0,
+                                part_transforms=None):
     """Multi-view version of texture_multipart."""
     logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
-                f"merged={len(merged.faces)} faces")
+                f"merged={len(merged.faces)} faces, "
+                f"has_transforms={part_transforms is not None}")
 
     v = merged.vertices
     vmin, vmax = v.min(axis=0), v.max(axis=0)
@@ -380,7 +385,7 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    return _split_and_assemble(textured, parts, center, scale, part_transforms)
 
 
 # =============================================================================
@@ -560,7 +565,7 @@ async def texture_mesh(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        parts, merged, is_multipart = load_glb_parts(mesh_path)
+        parts, merged, is_multipart, part_transforms = load_glb_parts(mesh_path)
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
@@ -572,6 +577,7 @@ async def texture_mesh(
                     result = texture_multipart(
                         tex_pipeline, parts, merged, image,
                         seed=seed, resolution=resolution, texture_size=texture_size,
+                        part_transforms=part_transforms,
                     )
                 else:
                     result = tex_pipeline.run(
@@ -629,7 +635,7 @@ async def texture_mesh_multiview(
         mesh_path = os.path.join(req_dir, f"input_mesh{os.path.splitext(mesh_file.filename)[1]}")
         with open(mesh_path, "wb") as buf:
             shutil.copyfileobj(mesh_file.file, buf)
-        parts, merged, is_multipart = load_glb_parts(mesh_path)
+        parts, merged, is_multipart, part_transforms = load_glb_parts(mesh_path)
 
         async with gpu_lock:
             await run_in_threadpool(ensure_model_loaded)
@@ -644,6 +650,7 @@ async def texture_mesh_multiview(
                         left_image=left_img, right_image=right_img,
                         seed=seed, resolution=resolution, texture_size=texture_size,
                         front_axis=front_axis, blend_temperature=blend_temperature,
+                        part_transforms=part_transforms,
                     )
                 else:
                     result = tex_pipeline.run_multiview(
