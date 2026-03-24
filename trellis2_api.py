@@ -301,19 +301,15 @@ def split_textured_mesh(textured, parts, center, scale):
 
 
 def _split_and_assemble(textured, parts, center, scale):
-    """Split textured mesh into parts, assemble Scene with transform-based positioning.
+    """Split textured mesh into parts, assemble Scene with shared TRS transform.
 
-    GLB format uses float32 for vertices — large world coordinates (±100K+) cause
-    precision/rendering issues. Instead, we keep each part's vertices in local space
-    (centered at its own centroid) and use the Scene graph transform to position it
-    at the correct world location. This matches how most GLB files store multi-part
-    scenes (small local coords + node transform).
+    All parts share ONE parent transform (normalized space → world space).
+    Part vertices remain in normalized space (small values, float32-safe).
+    The shared TRS ensures uniform precision across all parts — no inter-part
+    gaps from per-part float32 rounding, which was the failure mode of the
+    per-centroid approach with large world coordinates (±100K+).
 
-    Flow:
-      1. Split textured mesh (normalized space) into per-part submeshes
-      2. Restore each part to world coordinates: v_world = v_norm / scale + center
-      3. Center each part at its own centroid (small local coords)
-      4. Add to Scene with centroid as translation transform
+    Structure:  world → root (TRS) → part_0 (identity), part_1 (identity), ...
     """
     result_parts = split_textured_mesh(textured, parts, center, scale)
 
@@ -321,19 +317,33 @@ def _split_and_assemble(textured, parts, center, scale):
         logger.warning("Split failed — returning single textured mesh")
         return textured
 
-    scene = _trimesh.Scene()
-    for i, part in enumerate(result_parts):
-        # Restore to world coordinates
-        part.vertices = part.vertices / scale + center
-        # Move to local space: vertices centered at centroid, transform holds position
-        centroid = (part.vertices.min(0) + part.vertices.max(0)) / 2
-        part.vertices -= centroid
-        transform = np.eye(4)
-        transform[:3, 3] = centroid
-        scene.add_geometry(part, node_name=f"part_{i}", transform=transform)
-        logger.debug(f"Part {i}: {len(part.faces)} faces, centroid={centroid.tolist()}")
+    # Shared TRS: normalized → world.  v_world = v_norm / scale + center
+    inv_scale = 1.0 / scale
+    trs = np.eye(4)
+    trs[0, 0] = trs[1, 1] = trs[2, 2] = inv_scale
+    trs[:3, 3] = center
 
-    logger.info(f"Assembled {len(result_parts)} parts, "
+    scene = _trimesh.Scene()
+    base = scene.graph.base_frame
+
+    # Parent container with shared TRS
+    scene.graph.update(frame_from=base, frame_to='root', matrix=trs)
+
+    # Each part as child with identity transform
+    for i, part in enumerate(result_parts):
+        geom_name = f'part_{i}_mesh'
+        node_name = f'part_{i}'
+        scene.geometry[geom_name] = part
+        scene.graph.update(
+            frame_from='root',
+            frame_to=node_name,
+            matrix=np.eye(4),
+            geometry=geom_name,
+        )
+        logger.debug(f"Part {i}: {len(part.faces)} faces")
+
+    logger.info(f"Assembled {len(result_parts)} parts under shared TRS "
+                f"(inv_scale={inv_scale:.4f}, center={center.tolist()}), "
                 f"bounds={scene.bounds.tolist() if scene.bounds is not None else 'None'}")
     return scene
 
