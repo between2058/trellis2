@@ -340,8 +340,8 @@ def _split_and_assemble(textured, parts, center, scale):
 
 def texture_multipart(pipe, parts, merged, image, seed=42,
                       resolution=1024, texture_size=2048):
-    """Texture multi-part GLB: merge → run pipeline once → split."""
-    logger.info(f"Multipart texture: {len(parts)} parts, "
+    """Texture multi-part GLB: join mode — single mesh with world coords restored."""
+    logger.info(f"Multipart texture (join mode): {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
 
     v = merged.vertices
@@ -354,7 +354,12 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    # Restore world coordinates (pipeline outputs at [-0.5, 0.5])
+    textured.vertices = textured.vertices / scale + center
+    logger.info(f"Restored world coords: bbox=[{textured.vertices.min(0).tolist()}, "
+                f"{textured.vertices.max(0).tolist()}]")
+
+    return textured
 
 
 def texture_multipart_multiview(pipe, parts, merged,
@@ -362,8 +367,8 @@ def texture_multipart_multiview(pipe, parts, merged,
                                 left_image=None, right_image=None,
                                 seed=42, resolution=1024, texture_size=2048,
                                 front_axis='z', blend_temperature=2.0):
-    """Multi-view version of texture_multipart."""
-    logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
+    """Multi-view version of texture_multipart (join mode)."""
+    logger.info(f"Multipart texture (multiview, join mode): {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
 
     v = merged.vertices
@@ -380,7 +385,10 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Pipeline output: {len(textured.faces)} faces, "
                 f"{len(textured.vertices)} verts")
 
-    return _split_and_assemble(textured, parts, center, scale)
+    # Restore world coordinates
+    textured.vertices = textured.vertices / scale + center
+
+    return textured
 
 
 # =============================================================================
