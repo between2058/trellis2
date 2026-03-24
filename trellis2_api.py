@@ -158,18 +158,17 @@ def load_glb_parts(path: str):
 
     # Extract parts with world transforms from scene graph
     node_meshes = {}
-    has_non_identity = False
     for node_name in loaded.graph.nodes_geometry:
         transform, geom_name = loaded.graph[node_name]
         geom = loaded.geometry[geom_name]
         if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
             continue
 
+        local_center = (geom.bounds[0] + geom.bounds[1]) / 2
+        translation = transform[:3, 3]
         is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        if not is_identity:
-            has_non_identity = True
-        logger.debug(f"  Node '{node_name}': identity={is_identity}, "
-                     f"translation={transform[:3, 3].tolist()}")
+        logger.debug(f"  Node '{node_name}': local_center={local_center.tolist()}, "
+                     f"translation={translation.tolist()}, identity={is_identity}")
 
         mesh = geom.copy().apply_transform(transform)
         node_meshes.setdefault(node_name, []).append(mesh)
@@ -184,15 +183,6 @@ def load_glb_parts(path: str):
             parts.append(part)
 
     if len(parts) <= 1:
-        return [merged_ref], merged_ref, False
-
-    # Flat structure with non-identity transforms: auto-join into single mesh
-    # (like Blender Join). Per-part transforms cause precision/positioning issues
-    # in the split-and-assemble output. Hierarchical GLBs with identity transforms
-    # (e.g. robot-arm) still go through the multipart path.
-    if has_non_identity:
-        logger.info(f"Flat multi-part GLB detected ({len(parts)} parts with transforms) "
-                    f"— auto-joining into single mesh")
         return [merged_ref], merged_ref, False
 
     # Verify: our concatenated parts should match force='mesh' bounding box
