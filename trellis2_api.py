@@ -158,18 +158,17 @@ def load_glb_parts(path: str):
 
     # Extract parts with world transforms from scene graph
     node_meshes = {}
-    has_non_identity = False
     for node_name in loaded.graph.nodes_geometry:
         transform, geom_name = loaded.graph[node_name]
         geom = loaded.geometry[geom_name]
         if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
             continue
 
+        local_center = (geom.bounds[0] + geom.bounds[1]) / 2
+        translation = transform[:3, 3]
         is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        if not is_identity:
-            has_non_identity = True
-        logger.debug(f"  Node '{node_name}': identity={is_identity}, "
-                     f"translation={transform[:3, 3].tolist()}")
+        logger.debug(f"  Node '{node_name}': local_center={local_center.tolist()}, "
+                     f"translation={translation.tolist()}, identity={is_identity}")
 
         mesh = geom.copy().apply_transform(transform)
         node_meshes.setdefault(node_name, []).append(mesh)
@@ -185,17 +184,6 @@ def load_glb_parts(path: str):
 
     if len(parts) <= 1:
         return [merged_ref], merged_ref, False
-
-    # Flat multi-part with non-identity transforms: join into single mesh
-    # (replicates Blender Join: apply transforms + merge vertices + fix normals)
-    if has_non_identity:
-        joined = _trimesh.load(path, force='mesh', process=True)
-        joined.merge_vertices()
-        joined.fix_normals()
-        joined.update_faces(joined.nondegenerate)
-        logger.info(f"Auto-joined flat multi-part GLB: {len(parts)} parts -> "
-                    f"single mesh ({len(joined.vertices)} verts, {len(joined.faces)} faces)")
-        return [joined], joined, False
 
     # Verify: our concatenated parts should match force='mesh' bounding box
     concat = _trimesh.util.concatenate(parts)
