@@ -100,7 +100,7 @@ def save_texture_maps(mesh, output_dir):
     # base_color (RGB) + alpha (A) from baseColorTexture (RGBA)
     bc_tex = getattr(mat, 'baseColorTexture', None)
     if bc_tex is not None:
-        bc_img = bc_tex if isinstance(bc_tex, Image) else Image.fromarray(np.array(bc_tex))
+        bc_img = bc_tex if isinstance(bc_tex, Image.Image) else Image.fromarray(np.array(bc_tex))
         bc_img = bc_img.convert('RGBA')
         # base_color RGB
         bc_rgb = bc_img.convert('RGB')
@@ -114,7 +114,7 @@ def save_texture_maps(mesh, output_dir):
     # metallic + roughness from metallicRoughnessTexture (R=0, G=roughness, B=metallic)
     mr_tex = getattr(mat, 'metallicRoughnessTexture', None)
     if mr_tex is not None:
-        mr_img = mr_tex if isinstance(mr_tex, Image) else Image.fromarray(np.array(mr_tex))
+        mr_img = mr_tex if isinstance(mr_tex, Image.Image) else Image.fromarray(np.array(mr_tex))
         mr_img = mr_img.convert('RGB')
         # combined
         mr_img.save(os.path.join(output_dir, 'metallic_roughness.png'))
