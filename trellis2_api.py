@@ -86,12 +86,22 @@ gpu_lock = asyncio.Lock()
 
 
 def save_texture_maps(mesh, output_dir):
-    """Extract PBR texture maps from a trimesh object and save as PNGs.
+    """Extract PBR texture maps from a trimesh object or Scene and save as PNGs.
 
     Returns dict of {name: filename} for saved textures.
     """
     textures = {}
-    mat = getattr(mesh.visual, 'material', None)
+
+    # Scene: grab the first geometry that has a material
+    if isinstance(mesh, _trimesh.Scene):
+        for geom in mesh.geometry.values():
+            mat = getattr(getattr(geom, 'visual', None), 'material', None)
+            if mat is not None:
+                break
+        else:
+            return textures
+    else:
+        mat = getattr(getattr(mesh, 'visual', None), 'material', None)
     if mat is None:
         return textures
 
