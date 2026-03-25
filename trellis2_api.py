@@ -85,6 +85,50 @@ tex_pipeline = None
 gpu_lock = asyncio.Lock()
 
 
+def save_texture_maps(mesh, output_dir):
+    """Extract PBR texture maps from a trimesh object and save as PNGs.
+
+    Returns dict of {name: filename} for saved textures.
+    """
+    textures = {}
+    mat = getattr(mesh.visual, 'material', None)
+    if mat is None:
+        return textures
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # base_color (RGB) + alpha (A) from baseColorTexture (RGBA)
+    bc_tex = getattr(mat, 'baseColorTexture', None)
+    if bc_tex is not None:
+        bc_img = bc_tex if isinstance(bc_tex, Image) else Image.fromarray(np.array(bc_tex))
+        bc_img = bc_img.convert('RGBA')
+        # base_color RGB
+        bc_rgb = bc_img.convert('RGB')
+        bc_rgb.save(os.path.join(output_dir, 'base_color.png'))
+        textures['base_color'] = 'base_color.png'
+        # alpha
+        alpha = bc_img.split()[3]
+        alpha.save(os.path.join(output_dir, 'alpha.png'))
+        textures['alpha'] = 'alpha.png'
+
+    # metallic + roughness from metallicRoughnessTexture (R=0, G=roughness, B=metallic)
+    mr_tex = getattr(mat, 'metallicRoughnessTexture', None)
+    if mr_tex is not None:
+        mr_img = mr_tex if isinstance(mr_tex, Image) else Image.fromarray(np.array(mr_tex))
+        mr_img = mr_img.convert('RGB')
+        # combined
+        mr_img.save(os.path.join(output_dir, 'metallic_roughness.png'))
+        textures['metallic_roughness'] = 'metallic_roughness.png'
+        # split channels: R=0, G=roughness, B=metallic
+        _, roughness, metallic = mr_img.split()
+        metallic.save(os.path.join(output_dir, 'metallic.png'))
+        textures['metallic'] = 'metallic.png'
+        roughness.save(os.path.join(output_dir, 'roughness.png'))
+        textures['roughness'] = 'roughness.png'
+
+    return textures
+
+
 def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000000, remesh=True):
     """Convert MeshWithVoxel to GLB via o_voxel.postprocess."""
     glb = o_voxel.postprocess.to_glb(
@@ -103,6 +147,7 @@ def export_mesh_to_glb(mesh, glb_path, texture_size=4096, decimation_target=1000
         verbose=True,
     )
     glb.export(glb_path, extension_webp=True)
+    return glb
 
 
 def log_gpu_memory(label: str):
@@ -440,17 +485,19 @@ async def generate(
                 )
                 mesh = results[0]
                 glb_path = os.path.join(req_dir, "output.glb")
-                export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
-                                   decimation_target=decimation_target, remesh=remesh)
-                return glb_path
+                glb = export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
+                                        decimation_target=decimation_target, remesh=remesh)
+                tex_map = save_texture_maps(glb, req_dir)
+                return glb_path, tex_map
 
-            glb_path = await run_in_threadpool(_run)
+            glb_path, tex_map = await run_in_threadpool(_run)
             log_gpu_memory("after generate")
             torch.cuda.empty_cache()
 
         return {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
+            "textures": {k: f"/download/{request_id}/{v}" for k, v in tex_map.items()},
         }
     except Exception as e:
         logger.error(f"Generate failed: {e}", exc_info=True)
@@ -521,17 +568,19 @@ async def generate_multiview(
                 )
                 mesh = results[0]
                 glb_path = os.path.join(req_dir, "output.glb")
-                export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
-                                   decimation_target=decimation_target, remesh=remesh)
-                return glb_path
+                glb = export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
+                                        decimation_target=decimation_target, remesh=remesh)
+                tex_map = save_texture_maps(glb, req_dir)
+                return glb_path, tex_map
 
-            glb_path = await run_in_threadpool(_run)
+            glb_path, tex_map = await run_in_threadpool(_run)
             log_gpu_memory("after generate-multiview")
             torch.cuda.empty_cache()
 
         return {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
+            "textures": {k: f"/download/{request_id}/{v}" for k, v in tex_map.items()},
         }
     except Exception as e:
         logger.error(f"Generate-multiview failed: {e}", exc_info=True)
@@ -579,15 +628,17 @@ async def texture_mesh(
                         resolution=resolution, texture_size=texture_size,
                     )
                 result.export(out_path)
-                return out_path
+                tex_map = save_texture_maps(result, req_dir)
+                return out_path, tex_map
 
-            out_path = await run_in_threadpool(_run)
+            out_path, tex_map = await run_in_threadpool(_run)
             log_gpu_memory("after texture")
             torch.cuda.empty_cache()
 
         return {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
+            "textures": {k: f"/download/{request_id}/{v}" for k, v in tex_map.items()},
         }
     except Exception as e:
         logger.error(f"Texture failed: {e}", exc_info=True)
@@ -653,15 +704,17 @@ async def texture_mesh_multiview(
                         front_axis=front_axis, blend_temperature=blend_temperature,
                     )
                 result.export(out_path)
-                return out_path
+                tex_map = save_texture_maps(result, req_dir)
+                return out_path, tex_map
 
-            out_path = await run_in_threadpool(_run)
+            out_path, tex_map = await run_in_threadpool(_run)
             log_gpu_memory("after texture-multiview")
             torch.cuda.empty_cache()
 
         return {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
+            "textures": {k: f"/download/{request_id}/{v}" for k, v in tex_map.items()},
         }
     except Exception as e:
         logger.error(f"Texture-multiview failed: {e}", exc_info=True)
