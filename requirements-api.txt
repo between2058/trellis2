@@ -18,6 +18,7 @@ einops>=0.7.0
 # 3D geometry
 trimesh>=4.0.0
 open3d>=0.18.0
+pynanoinstantmeshes>=0.0.3
 
 # Utilities
 tqdm>=4.65.0

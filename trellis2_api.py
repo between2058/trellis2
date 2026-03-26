@@ -463,8 +463,10 @@ async def generate(
     texture_size: int = Form(1024),
     decimation_target: int = Form(1000000),
     remesh: bool = Form(True),
+    quad: bool = Form(False),
+    quad_vertex_count: int = Form(5000),
 ):
-    """Single image to 3D mesh."""
+    """Single image to 3D mesh. Set quad=True for quad topology (requires re-texturing)."""
     try:
         request_id = str(uuid.uuid4())
         req_dir = os.path.join(OUTPUT_DIR, request_id)
@@ -497,18 +499,58 @@ async def generate(
                 glb_path = os.path.join(req_dir, "output.glb")
                 glb = export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
                                         decimation_target=decimation_target, remesh=remesh)
-                tex_map = save_texture_maps(glb, req_dir)
-                return glb_path, tex_map
 
-            glb_path, tex_map = await run_in_threadpool(_run)
+                if not quad:
+                    tex_map = save_texture_maps(glb, req_dir)
+                    return glb_path, tex_map, "tri"
+
+                # Quad path: remesh to quads then re-texture
+                import pynanoinstantmeshes as PyNIM
+                logger.info(f"[{request_id}] Quad remeshing...")
+                tri_mesh = glb if isinstance(glb, _trimesh.Trimesh) else list(glb.geometry.values())[0]
+                v_out, f_out = PyNIM.remesh(
+                    tri_mesh.vertices.astype(np.float32),
+                    tri_mesh.faces.astype(np.uint32),
+                    vertex_count=quad_vertex_count,
+                    posy=4,
+                    creaseAngle=60.0,
+                    deterministic=True,
+                )
+                # Save quad OBJ
+                obj_path = os.path.join(req_dir, "output_quad.obj")
+                with open(obj_path, "w") as f:
+                    for v in v_out:
+                        f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+                    for face in f_out:
+                        indices = " ".join(str(i + 1) for i in face)
+                        f.write(f"f {indices}\n")
+
+                # Re-texture quad mesh
+                logger.info(f"[{request_id}] Re-texturing quad mesh...")
+                quad_mesh = _trimesh.load(obj_path, force='mesh')
+                result = tex_pipeline.run(
+                    quad_mesh, image, seed=seed,
+                    resolution=int(pipeline_type.split("_")[0]),
+                    texture_size=texture_size,
+                )
+                quad_glb_path = os.path.join(req_dir, "output.glb")
+                result.export(quad_glb_path)
+                tex_map = save_texture_maps(result, req_dir)
+                return quad_glb_path, tex_map, "quad"
+
+            glb_path, tex_map, topo = await run_in_threadpool(_run)
             log_gpu_memory("after generate")
             torch.cuda.empty_cache()
 
-        return {
+        resp = {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
             "textures": {k: f"/download/{request_id}/{v}" for k, v in tex_map.items()},
+            "topology": topo,
         }
+        if topo == "quad":
+            resp["obj_url"] = f"/download/{request_id}/output_quad.obj"
+        return resp
     except Exception as e:
         logger.error(f"Generate failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -532,8 +574,10 @@ async def generate_multiview(
     texture_size: int = Form(1024),
     decimation_target: int = Form(1000000),
     remesh: bool = Form(True),
+    quad: bool = Form(False),
+    quad_vertex_count: int = Form(5000),
 ):
-    """Multi-view images to 3D mesh."""
+    """Multi-view images to 3D mesh. Set quad=True for quad topology."""
     try:
         request_id = str(uuid.uuid4())
         req_dir = os.path.join(OUTPUT_DIR, request_id)
@@ -580,18 +624,56 @@ async def generate_multiview(
                 glb_path = os.path.join(req_dir, "output.glb")
                 glb = export_mesh_to_glb(mesh, glb_path, texture_size=texture_size,
                                         decimation_target=decimation_target, remesh=remesh)
-                tex_map = save_texture_maps(glb, req_dir)
-                return glb_path, tex_map
 
-            glb_path, tex_map = await run_in_threadpool(_run)
+                if not quad:
+                    tex_map = save_texture_maps(glb, req_dir)
+                    return glb_path, tex_map, "tri"
+
+                # Quad path: remesh to quads then re-texture
+                import pynanoinstantmeshes as PyNIM
+                logger.info(f"[{request_id}] Quad remeshing...")
+                tri_mesh = glb if isinstance(glb, _trimesh.Trimesh) else list(glb.geometry.values())[0]
+                v_out, f_out = PyNIM.remesh(
+                    tri_mesh.vertices.astype(np.float32),
+                    tri_mesh.faces.astype(np.uint32),
+                    vertex_count=quad_vertex_count,
+                    posy=4,
+                    creaseAngle=60.0,
+                    deterministic=True,
+                )
+                obj_path = os.path.join(req_dir, "output_quad.obj")
+                with open(obj_path, "w") as f:
+                    for v in v_out:
+                        f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+                    for face in f_out:
+                        indices = " ".join(str(i + 1) for i in face)
+                        f.write(f"f {indices}\n")
+
+                logger.info(f"[{request_id}] Re-texturing quad mesh...")
+                quad_mesh = _trimesh.load(obj_path, force='mesh')
+                result = tex_pipeline.run(
+                    quad_mesh, front_img, seed=seed,
+                    resolution=int(pipeline_type.split("_")[0]),
+                    texture_size=texture_size,
+                )
+                quad_glb_path = os.path.join(req_dir, "output.glb")
+                result.export(quad_glb_path)
+                tex_map = save_texture_maps(result, req_dir)
+                return quad_glb_path, tex_map, "quad"
+
+            glb_path, tex_map, topo = await run_in_threadpool(_run)
             log_gpu_memory("after generate-multiview")
             torch.cuda.empty_cache()
 
-        return {
+        resp = {
             "request_id": request_id,
             "glb_url": f"/download/{request_id}/output.glb",
             "textures": {k: f"/download/{request_id}/{v}" for k, v in tex_map.items()},
+            "topology": topo,
         }
+        if topo == "quad":
+            resp["obj_url"] = f"/download/{request_id}/output_quad.obj"
+        return resp
     except Exception as e:
         logger.error(f"Generate-multiview failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -844,6 +926,59 @@ async def mesh_weld_vertices(
         return await _load_and_process_mesh(mesh_file, weld_vertices)
     except Exception as e:
         logger.error(f"Weld vertices failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mesh-process/quad-remesh")
+async def mesh_quad_remesh(
+    mesh_file: UploadFile = File(...),
+    target_vertex_count: int = Form(5000, description="Target number of vertices"),
+    crease_angle: float = Form(60.0, description="Sharp edge detection angle in degrees"),
+):
+    """Remesh to quad topology using Instant Meshes. Output is OBJ (GLB does not support quads)."""
+    import pynanoinstantmeshes as PyNIM
+    try:
+        request_id = str(uuid.uuid4())
+        req_dir = os.path.join(OUTPUT_DIR, request_id)
+        os.makedirs(req_dir, exist_ok=True)
+
+        mesh_path = os.path.join(req_dir, f"input{os.path.splitext(mesh_file.filename)[1]}")
+        with open(mesh_path, "wb") as buf:
+            shutil.copyfileobj(mesh_file.file, buf)
+        mesh = _trimesh.load(mesh_path, force='mesh')
+
+        def _run():
+            v_in = mesh.vertices.astype(np.float32)
+            f_in = mesh.faces.astype(np.uint32)
+            v_out, f_out = PyNIM.remesh(
+                v_in, f_in,
+                vertex_count=target_vertex_count,
+                posy=4,
+                creaseAngle=crease_angle,
+                deterministic=True,
+            )
+            return v_out, f_out
+
+        v_out, f_out = await run_in_threadpool(_run)
+
+        # OBJ supports quads natively; write manually to preserve quad faces
+        out_path = os.path.join(req_dir, "output.obj")
+        with open(out_path, "w") as f:
+            for v in v_out:
+                f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+            for face in f_out:
+                indices = " ".join(str(i + 1) for i in face)
+                f.write(f"f {indices}\n")
+
+        return {
+            "request_id": request_id,
+            "obj_url": f"/download/{request_id}/output.obj",
+            "vertices": len(v_out),
+            "faces": len(f_out),
+            "topology": "quad",
+        }
+    except Exception as e:
+        logger.error(f"Quad remesh failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
