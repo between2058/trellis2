@@ -65,7 +65,7 @@ RUN pip install --no-cache-dir \
 # ── API deps ─────────────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir \
     fastapi==0.115.5 "uvicorn[standard]==0.32.1" python-multipart==0.0.17 \
-    "pydantic>=2.0.0" "open3d>=0.18.0"
+    "pydantic>=2.0.0" "open3d>=0.18.0" "pynanoinstantmeshes>=0.0.3"
 
 # ── flash-attn (from setup.sh --flash-attn) ─────────────────────────────────
 RUN MAX_JOBS=${MAX_JOBS} pip install --no-cache-dir --no-build-isolation \
