@@ -77,7 +77,8 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-OUTPUT_DIR = tempfile.mkdtemp()
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/app/outputs")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 logger.info(f"Output directory: {OUTPUT_DIR}")
 
 pipeline = None
