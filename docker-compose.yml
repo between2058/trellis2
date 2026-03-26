@@ -25,6 +25,7 @@ services:
 
     volumes:
       - ${HF_CACHE_PATH}:/app/hf_cache:rw
+      - ${OUTPUT_PATH:-./outputs}:/app/outputs:rw
       - ./logs:/app/logs
 
     environment:
