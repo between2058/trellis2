@@ -190,6 +190,36 @@ def ensure_model_loaded():
 # Multi-part GLB helpers
 # =============================================================================
 
+def _detect_scene_scale(scene):
+    """Detect embedded scale factor in a Scene's node transforms.
+
+    Many 3D tools embed coordinate-system conversion (unit scale, axis
+    rotation) in a root/parent transform. This propagates into each node's
+    world transform as a scale factor, making world-space vertices orders of
+    magnitude larger than the local geometry.
+
+    Returns the median per-node scale. If all transforms are ~identity or
+    pure rotation+translation, returns 1.0.
+    """
+    scales = []
+    for node_name in scene.graph.nodes_geometry:
+        transform, geom_name = scene.graph[node_name]
+        geom = scene.geometry[geom_name]
+        if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
+            continue
+        M = transform[:3, :3]
+        # Scale = geometric mean of column norms (rotation-invariant)
+        sx = np.linalg.norm(M[:, 0])
+        sy = np.linalg.norm(M[:, 1])
+        sz = np.linalg.norm(M[:, 2])
+        node_scale = (sx * sy * sz) ** (1.0 / 3.0)
+        if node_scale > 1e-6:
+            scales.append(node_scale)
+    if not scales:
+        return 1.0
+    return float(np.median(scales))
+
+
 def load_glb_parts(path: str):
     """Load GLB and return (parts, merged_mesh, is_multipart).
 
