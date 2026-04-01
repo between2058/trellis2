@@ -193,13 +193,12 @@ def ensure_model_loaded():
 def _detect_scene_scale(scene):
     """Detect embedded scale factor in a Scene's node transforms.
 
-    Many 3D tools embed coordinate-system conversion (unit scale, axis
-    rotation) in a root/parent transform. This propagates into each node's
-    world transform as a scale factor, making world-space vertices orders of
-    magnitude larger than the local geometry.
+    Scale can be hidden in two places:
+    1. Transform 3x3 matrix (rotation × scale) — e.g. coordinate system conversion
+    2. Geometry vertices themselves — e.g. tool baked scale into vertex data
 
-    Returns the median per-node scale. If all transforms are ~identity or
-    pure rotation+translation, returns 1.0.
+    Compares each part's local geometry extent to its world (post-transform)
+    extent. Returns the median ratio. If no significant scale is found, returns 1.0.
     """
     scales = []
     for node_name in scene.graph.nodes_geometry:
@@ -207,14 +206,15 @@ def _detect_scene_scale(scene):
         geom = scene.geometry[geom_name]
         if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
             continue
-        M = transform[:3, :3]
-        # Scale = geometric mean of column norms (rotation-invariant)
-        sx = np.linalg.norm(M[:, 0])
-        sy = np.linalg.norm(M[:, 1])
-        sz = np.linalg.norm(M[:, 2])
-        node_scale = (sx * sy * sz) ** (1.0 / 3.0)
-        if node_scale > 1e-6:
-            scales.append(node_scale)
+        # Use bounding-sphere radius (rotation-invariant) instead of AABB
+        local_centroid = geom.vertices.mean(axis=0)
+        local_radius = np.linalg.norm(geom.vertices - local_centroid, axis=1).max()
+        if local_radius < 1e-6:
+            continue
+        world_mesh = geom.copy().apply_transform(transform)
+        world_centroid = world_mesh.vertices.mean(axis=0)
+        world_radius = np.linalg.norm(world_mesh.vertices - world_centroid, axis=1).max()
+        scales.append(world_radius / local_radius)
     if not scales:
         return 1.0
     return float(np.median(scales))
@@ -252,6 +252,17 @@ def load_glb_parts(path: str):
     if has_scale:
         merged_ref.vertices = merged_ref.vertices / scene_scale
 
+    # Heuristic: if geometry is still very large after transform stripping,
+    # assume non-meter units (e.g. DXF in mm) and convert to meters.
+    ref_extent = (merged_ref.bounds[1] - merged_ref.bounds[0]).max()
+    if ref_extent > 1000:
+        unit_correction = 0.001  # mm → m
+        merged_ref.vertices = merged_ref.vertices * unit_correction
+        logger.info(f"Unit correction: extent {ref_extent:.0f} > 1000, "
+                    f"assuming mm — applying ×{unit_correction}")
+    else:
+        unit_correction = 1.0
+
     # Extract mesh parts with world transforms (skip non-mesh nodes)
     node_meshes = {}
     for node_name in loaded.graph.nodes_geometry:
@@ -271,6 +282,8 @@ def load_glb_parts(path: str):
         mesh = geom.copy().apply_transform(transform)
         if has_scale:
             mesh.vertices = mesh.vertices / scene_scale
+        if unit_correction != 1.0:
+            mesh.vertices = mesh.vertices * unit_correction
         node_meshes.setdefault(node_name, []).append(mesh)
 
     if not node_meshes:
@@ -306,6 +319,9 @@ def load_glb_parts(path: str):
         if has_scale:
             for p in parts:
                 p.vertices = p.vertices / scene_scale
+        if unit_correction != 1.0:
+            for p in parts:
+                p.vertices = p.vertices * unit_correction
         if len(parts) <= 1:
             return [merged_ref], merged_ref, False
         concat2 = _trimesh.util.concatenate(parts)
