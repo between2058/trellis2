@@ -141,3 +141,72 @@ class TestDetectSceneScale:
         from trellis2_api import _detect_scene_scale
         scene = trimesh.Scene()
         assert _detect_scene_scale(scene) == pytest.approx(1.0)
+
+
+import io
+
+
+def _scene_to_glb_bytes(scene):
+    """Export scene to in-memory GLB bytes."""
+    return scene.export(file_type="glb")
+
+
+def _glb_bytes_to_file(data, tmp_path, name="test.glb"):
+    """Write GLB bytes to a temp file, return path."""
+    p = tmp_path / name
+    p.write_bytes(data)
+    return str(p)
+
+
+class TestLoadGlbParts:
+
+    def test_no_scale_preserves_coords(self, tmp_path):
+        """Parts without scale: world coords preserved as-is."""
+        from trellis2_api import load_glb_parts
+        scene = _make_scene([
+            ([2, 2, 2], _tf_translate(10, 0, 0)),
+            ([1, 3, 1], _tf_translate(20, 5, 0)),
+        ])
+        path = _glb_bytes_to_file(_scene_to_glb_bytes(scene), tmp_path)
+        parts, merged, is_mp = load_glb_parts(path)
+        assert is_mp is True
+        assert len(parts) == 2
+        assert merged.bounds[0][0] == pytest.approx(9.0, abs=0.1)
+        assert merged.bounds[1][0] == pytest.approx(20.5, abs=0.1)
+
+    def test_large_scale_stripped(self, tmp_path):
+        """Parts with 1000x scale: output coords at local geometry scale."""
+        from trellis2_api import load_glb_parts
+        S = 1000.0
+        scene = _make_scene([
+            ([2, 2, 2], _tf_scale_translate(S, S, S, S * 10, 0, 0)),
+            ([1, 3, 1], _tf_scale_translate(S, S, S, S * 20, S * 5, 0)),
+        ])
+        path = _glb_bytes_to_file(_scene_to_glb_bytes(scene), tmp_path)
+        parts, merged, is_mp = load_glb_parts(path)
+        assert is_mp is True
+        bbox_range = merged.bounds[1] - merged.bounds[0]
+        assert bbox_range.max() < 100
+
+    def test_single_mesh_with_scale_stripped(self, tmp_path):
+        """Single mesh + scale: scale still stripped from merged_ref."""
+        from trellis2_api import load_glb_parts
+        S = 56000.0
+        scene = _make_scene([
+            ([3, 5, 3], _tf_scale_translate(S, S, S, S * 2, S * 1, 0)),
+        ])
+        path = _glb_bytes_to_file(_scene_to_glb_bytes(scene), tmp_path)
+        parts, merged, is_mp = load_glb_parts(path)
+        assert is_mp is False
+        bbox_range = merged.bounds[1] - merged.bounds[0]
+        assert bbox_range.max() < 100
+
+    def test_raw_trimesh_unchanged(self, tmp_path):
+        """A plain .glb with a single Trimesh (no Scene): returned as-is."""
+        from trellis2_api import load_glb_parts
+        mesh = trimesh.creation.box(extents=[2, 3, 4])
+        mesh.vertices += [10, 5, 0]
+        path = _glb_bytes_to_file(mesh.export(file_type="glb"), tmp_path)
+        parts, merged, is_mp = load_glb_parts(path)
+        assert is_mp is False
+        assert merged.bounds[1][0] == pytest.approx(11.0, abs=0.1)

@@ -223,10 +223,10 @@ def _detect_scene_scale(scene):
 def load_glb_parts(path: str):
     """Load GLB and return (parts, merged_mesh, is_multipart).
 
-    Uses force='mesh' as ground truth for the merged mesh (handles all GLB
-    structures correctly). Extracts individual parts from the scene graph
-    with world transforms baked in. If the parts don't match force='mesh',
-    falls back to single-mesh mode.
+    Handles:
+    - Scene-level scale in transforms (detected and stripped)
+    - Non-mesh nodes (cameras, lights) filtered out
+    - Single vs multi-part detection
     """
     loaded = _trimesh.load(path, process=False)
 
@@ -236,13 +236,23 @@ def load_glb_parts(path: str):
     if not isinstance(loaded, _trimesh.Scene):
         raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
+    # Detect and log scene-level scale from transforms
+    scene_scale = _detect_scene_scale(loaded)
+    has_scale = scene_scale > 2.0
+    if has_scale:
+        logger.info(f"Detected scene-level scale: {scene_scale:.4f} — will strip")
+
     # Ground truth: force='mesh' correctly handles ALL transform structures
     merged_ref = _trimesh.load(path, force='mesh', process=False)
-    ref_bbox = merged_ref.bounds  # (2, 3) array: [min, max]
+    ref_bbox = merged_ref.bounds
     logger.info(f"force='mesh' reference: {len(merged_ref.vertices)} verts, "
                 f"bbox_range={ref_bbox[1] - ref_bbox[0]}")
 
-    # Extract parts with world transforms from scene graph
+    # Strip scene scale from merged_ref
+    if has_scale:
+        merged_ref.vertices = merged_ref.vertices / scene_scale
+
+    # Extract mesh parts with world transforms (skip non-mesh nodes)
     node_meshes = {}
     for node_name in loaded.graph.nodes_geometry:
         transform, geom_name = loaded.graph[node_name]
@@ -250,13 +260,17 @@ def load_glb_parts(path: str):
         if not isinstance(geom, _trimesh.Trimesh) or len(geom.faces) == 0:
             continue
 
-        local_center = (geom.bounds[0] + geom.bounds[1]) / 2
-        translation = transform[:3, 3]
+        M = transform[:3, :3]
+        sx = np.linalg.norm(M[:, 0])
+        sy = np.linalg.norm(M[:, 1])
+        sz = np.linalg.norm(M[:, 2])
         is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        logger.debug(f"  Node '{node_name}': local_center={local_center.tolist()}, "
-                     f"translation={translation.tolist()}, identity={is_identity}")
+        logger.debug(f"  Node '{node_name}': scale=({sx:.4f}, {sy:.4f}, {sz:.4f}), "
+                     f"translation={transform[:3, 3].tolist()}, identity={is_identity}")
 
         mesh = geom.copy().apply_transform(transform)
+        if has_scale:
+            mesh.vertices = mesh.vertices / scene_scale
         node_meshes.setdefault(node_name, []).append(mesh)
 
     if not node_meshes:
@@ -271,10 +285,11 @@ def load_glb_parts(path: str):
     if len(parts) <= 1:
         return [merged_ref], merged_ref, False
 
-    # Verify: our concatenated parts should match force='mesh' bounding box
+    # Verify: concatenated parts should match reference bounding box
     concat = _trimesh.util.concatenate(parts)
     concat_bbox = concat.bounds
-    bbox_match = np.allclose(ref_bbox, concat_bbox, atol=0.01)
+    ref_bbox_now = merged_ref.bounds  # after scale stripping
+    bbox_match = np.allclose(ref_bbox_now, concat_bbox, atol=0.01)
     logger.info(f"Extracted {len(parts)} parts, concat {len(concat.vertices)} verts, "
                 f"bbox_range={concat_bbox[1] - concat_bbox[0]}, "
                 f"match_ref={bbox_match}")
@@ -282,23 +297,24 @@ def load_glb_parts(path: str):
     if not bbox_match:
         logger.warning(
             f"Part extraction bbox mismatch! "
-            f"ref={ref_bbox.tolist()} vs ours={concat_bbox.tolist()}. "
+            f"ref={ref_bbox_now.tolist()} vs ours={concat_bbox.tolist()}. "
             f"Retrying with scene.dump()..."
         )
-        # scene.dump applies transforms the same way force='mesh' does internally
         dumped = loaded.dump(concatenate=False)
         parts = [m for m in dumped
                  if isinstance(m, _trimesh.Trimesh) and len(m.faces) > 0]
+        if has_scale:
+            for p in parts:
+                p.vertices = p.vertices / scene_scale
         if len(parts) <= 1:
             return [merged_ref], merged_ref, False
         concat2 = _trimesh.util.concatenate(parts)
-        bbox_match2 = np.allclose(ref_bbox, concat2.bounds, atol=0.01)
+        bbox_match2 = np.allclose(ref_bbox_now, concat2.bounds, atol=0.01)
         logger.info(f"scene.dump() gave {len(parts)} parts, match_ref={bbox_match2}")
         if not bbox_match2:
             logger.warning("Still mismatched — falling back to single mesh")
             return [merged_ref], merged_ref, False
 
-    # Always use force='mesh' for the pipeline input (guaranteed correct)
     return parts, merged_ref, True
 
 
