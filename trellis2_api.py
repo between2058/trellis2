@@ -402,6 +402,30 @@ def split_textured_mesh(textured, parts, center, scale):
     return result if len(result) > 0 else None
 
 
+def _compute_normalization(mesh):
+    """Compute the center and scale that preprocess_mesh will use.
+
+    Returns (center, scale) matching the pipeline's preprocess_mesh logic,
+    so callers can reverse the normalization after pipeline.run().
+    """
+    v = mesh.vertices
+    vmin, vmax = v.min(axis=0), v.max(axis=0)
+    center = (vmin + vmax) / 2
+    scale = 0.99999 / (vmax - vmin).max()
+    return center, scale
+
+
+def _denormalize_mesh(mesh, center, scale):
+    """Reverse the pipeline's normalization: restore original coordinates.
+
+    After pipeline.run(), output vertices are at (orig - center) * scale
+    (axis swaps from preprocess/postprocess cancel out). This restores them.
+    Returns the mesh (modified in-place).
+    """
+    mesh.vertices = mesh.vertices / scale + center
+    return mesh
+
+
 def _split_and_assemble(textured, parts, center, scale):
     """Split textured mesh into parts, assemble Scene with transform-based positioning.
 
@@ -420,8 +444,8 @@ def _split_and_assemble(textured, parts, center, scale):
     result_parts = split_textured_mesh(textured, parts, center, scale)
 
     if result_parts is None:
-        logger.warning("Split failed — returning single textured mesh")
-        return textured
+        logger.warning("Split failed — returning denormalized single mesh as fallback")
+        return _denormalize_mesh(textured, center, scale)
 
     scene = _trimesh.Scene()
     for i, part in enumerate(result_parts):
@@ -446,10 +470,7 @@ def texture_multipart(pipe, parts, merged, image, seed=42,
     logger.info(f"Multipart texture: {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
 
-    v = merged.vertices
-    vmin, vmax = v.min(axis=0), v.max(axis=0)
-    center = (vmin + vmax) / 2
-    scale = 0.99999 / (vmax - vmin).max()
+    center, scale = _compute_normalization(merged)
 
     textured = pipe.run(merged, image, seed=seed,
                         resolution=resolution, texture_size=texture_size)
@@ -468,10 +489,7 @@ def texture_multipart_multiview(pipe, parts, merged,
     logger.info(f"Multipart texture (multiview): {len(parts)} parts, "
                 f"merged={len(merged.faces)} faces")
 
-    v = merged.vertices
-    vmin, vmax = v.min(axis=0), v.max(axis=0)
-    center = (vmin + vmax) / 2
-    scale = 0.99999 / (vmax - vmin).max()
+    center, scale = _compute_normalization(merged)
 
     textured = pipe.run_multiview(
         merged, front_image=front_image, back_image=back_image,
@@ -762,10 +780,12 @@ async def texture_mesh(
                         seed=seed, resolution=resolution, texture_size=texture_size,
                     )
                 else:
+                    center, scale = _compute_normalization(merged)
                     result = tex_pipeline.run(
                         merged, image, seed=seed,
                         resolution=resolution, texture_size=texture_size,
                     )
+                    _denormalize_mesh(result, center, scale)
                 result.export(out_path)
                 tex_map = save_texture_maps(result, req_dir)
                 return out_path, tex_map
@@ -836,12 +856,14 @@ async def texture_mesh_multiview(
                         front_axis=front_axis, blend_temperature=blend_temperature,
                     )
                 else:
+                    center, scale = _compute_normalization(merged)
                     result = tex_pipeline.run_multiview(
                         merged, front_image=front_img, back_image=back_img,
                         left_image=left_img, right_image=right_img,
                         seed=seed, resolution=resolution, texture_size=texture_size,
                         front_axis=front_axis, blend_temperature=blend_temperature,
                     )
+                    _denormalize_mesh(result, center, scale)
                 result.export(out_path)
                 tex_map = save_texture_maps(result, req_dir)
                 return out_path, tex_map

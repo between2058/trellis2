@@ -210,3 +210,41 @@ class TestLoadGlbParts:
         parts, merged, is_mp = load_glb_parts(path)
         assert is_mp is False
         assert merged.bounds[1][0] == pytest.approx(11.0, abs=0.1)
+
+
+class TestDenormalizeMesh:
+    """Tests for _compute_normalization + _denormalize_mesh round-trip."""
+
+    def test_round_trip(self):
+        """normalize → denormalize should recover original bounds."""
+        from trellis2_api import _compute_normalization, _denormalize_mesh
+        mesh = trimesh.creation.box(extents=[4, 6, 2])
+        mesh.vertices += [100, 50, 0]
+        original_bounds = mesh.bounds.copy()
+
+        center, scale = _compute_normalization(mesh)
+
+        # Simulate pipeline output (axis swaps cancel, verts in normalized space)
+        norm_verts = (mesh.vertices - center) * scale
+        assert norm_verts.min() >= -0.5 - 1e-6
+        assert norm_verts.max() <= 0.5 + 1e-6
+
+        fake_output = trimesh.Trimesh(vertices=norm_verts, faces=mesh.faces, process=False)
+        restored = _denormalize_mesh(fake_output, center, scale)
+
+        np.testing.assert_allclose(restored.bounds, original_bounds, atol=0.01)
+
+    def test_offset_mesh(self):
+        """Mesh far from origin: denormalize restores position."""
+        from trellis2_api import _compute_normalization, _denormalize_mesh
+        mesh = trimesh.creation.box(extents=[2, 2, 2])
+        mesh.vertices += [500, 300, 100]
+
+        center, scale = _compute_normalization(mesh)
+        norm_verts = (mesh.vertices - center) * scale
+        fake_output = trimesh.Trimesh(vertices=norm_verts, faces=mesh.faces, process=False)
+        restored = _denormalize_mesh(fake_output, center, scale)
+
+        expected_center = np.array([500, 300, 100])
+        actual_center = (restored.bounds[0] + restored.bounds[1]) / 2
+        np.testing.assert_allclose(actual_center, expected_center, atol=0.01)
