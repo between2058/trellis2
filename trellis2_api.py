@@ -224,7 +224,7 @@ def load_glb_parts(path: str):
     """Load GLB and return (parts, merged_mesh, is_multipart).
 
     Handles:
-    - Scene-level scale in transforms (detected and stripped)
+    - Quantized geometry coordinates (IFC/DXF: vertices at ±32767 range)
     - Non-mesh nodes (cameras, lights) filtered out
     - Single vs multi-part detection
     """
@@ -236,34 +236,7 @@ def load_glb_parts(path: str):
     if not isinstance(loaded, _trimesh.Scene):
         raise ValueError(f"Unexpected type from trimesh.load: {type(loaded)}")
 
-    # Detect and log scene-level scale from transforms
-    scene_scale = _detect_scene_scale(loaded)
-    has_scale = scene_scale > 2.0
-    if has_scale:
-        logger.info(f"Detected scene-level scale: {scene_scale:.4f} — will strip")
-
-    # Ground truth: force='mesh' correctly handles ALL transform structures
-    merged_ref = _trimesh.load(path, force='mesh', process=False)
-    ref_bbox = merged_ref.bounds
-    logger.info(f"force='mesh' reference: {len(merged_ref.vertices)} verts, "
-                f"bbox_range={ref_bbox[1] - ref_bbox[0]}")
-
-    # Strip scene scale from merged_ref
-    if has_scale:
-        merged_ref.vertices = merged_ref.vertices / scene_scale
-
-    # Heuristic: if geometry is still very large after transform stripping,
-    # assume non-meter units (e.g. DXF in mm) and convert to meters.
-    ref_extent = (merged_ref.bounds[1] - merged_ref.bounds[0]).max()
-    if ref_extent > 1000:
-        unit_correction = 0.001  # mm → m
-        merged_ref.vertices = merged_ref.vertices * unit_correction
-        logger.info(f"Unit correction: extent {ref_extent:.0f} > 1000, "
-                    f"assuming mm — applying ×{unit_correction}")
-    else:
-        unit_correction = 1.0
-
-    # Extract mesh parts with world transforms (skip non-mesh nodes)
+    # Extract mesh parts: normalize quantized geometry, then apply transforms
     node_meshes = {}
     for node_name in loaded.graph.nodes_geometry:
         transform, geom_name = loaded.graph[node_name]
@@ -276,17 +249,24 @@ def load_glb_parts(path: str):
         sy = np.linalg.norm(M[:, 1])
         sz = np.linalg.norm(M[:, 2])
         is_identity = np.allclose(transform, np.eye(4), atol=1e-6)
-        logger.debug(f"  Node '{node_name}': scale=({sx:.4f}, {sy:.4f}, {sz:.4f}), "
-                     f"translation={transform[:3, 3].tolist()}, identity={is_identity}")
 
-        mesh = geom.copy().apply_transform(transform)
-        if has_scale:
-            mesh.vertices = mesh.vertices / scene_scale
-        if unit_correction != 1.0:
-            mesh.vertices = mesh.vertices * unit_correction
+        # Detect quantized coordinates (IFC/DXF encode vertices as INT16 ±32767)
+        geom_copy = geom.copy()
+        max_abs = np.abs(geom_copy.vertices).max()
+        if max_abs > 10000:
+            geom_copy.vertices = geom_copy.vertices / max_abs
+            logger.debug(f"  Node '{node_name}': quantized (max_abs={max_abs:.0f}), "
+                         f"normalized to [-1,1], scale=({sx:.4f}, {sy:.4f}, {sz:.4f}), "
+                         f"translation={transform[:3, 3].tolist()}")
+        else:
+            logger.debug(f"  Node '{node_name}': scale=({sx:.4f}, {sy:.4f}, {sz:.4f}), "
+                         f"translation={transform[:3, 3].tolist()}, identity={is_identity}")
+
+        mesh = geom_copy.apply_transform(transform)
         node_meshes.setdefault(node_name, []).append(mesh)
 
     if not node_meshes:
+        merged_ref = _trimesh.load(path, force='mesh', process=False)
         return [merged_ref], merged_ref, False
 
     parts = []
@@ -295,41 +275,25 @@ def load_glb_parts(path: str):
         if len(part.faces) > 0:
             parts.append(part)
 
+    # Build merged from our (possibly de-quantized) parts
+    merged_ref = _trimesh.util.concatenate(parts) if parts else _trimesh.load(path, force='mesh', process=False)
+
+    # Post-transform check: if world extent is still huge (e.g. transform
+    # had large scale on normal geometry), detect and strip it
+    world_extent = (merged_ref.bounds[1] - merged_ref.bounds[0]).max()
+    scene_scale = _detect_scene_scale(loaded)
+    if scene_scale > 2.0 and world_extent > 100:
+        logger.info(f"Stripping transform scale {scene_scale:.4f} "
+                    f"(world_extent={world_extent:.0f})")
+        merged_ref.vertices = merged_ref.vertices / scene_scale
+        for p in parts:
+            p.vertices = p.vertices / scene_scale
+
+    logger.info(f"Loaded {len(parts)} mesh parts, merged {len(merged_ref.vertices)} verts, "
+                f"bbox_range={merged_ref.bounds[1] - merged_ref.bounds[0]}")
+
     if len(parts) <= 1:
         return [merged_ref], merged_ref, False
-
-    # Verify: concatenated parts should match reference bounding box
-    concat = _trimesh.util.concatenate(parts)
-    concat_bbox = concat.bounds
-    ref_bbox_now = merged_ref.bounds  # after scale stripping
-    bbox_match = np.allclose(ref_bbox_now, concat_bbox, atol=0.01)
-    logger.info(f"Extracted {len(parts)} parts, concat {len(concat.vertices)} verts, "
-                f"bbox_range={concat_bbox[1] - concat_bbox[0]}, "
-                f"match_ref={bbox_match}")
-
-    if not bbox_match:
-        logger.warning(
-            f"Part extraction bbox mismatch! "
-            f"ref={ref_bbox_now.tolist()} vs ours={concat_bbox.tolist()}. "
-            f"Retrying with scene.dump()..."
-        )
-        dumped = loaded.dump(concatenate=False)
-        parts = [m for m in dumped
-                 if isinstance(m, _trimesh.Trimesh) and len(m.faces) > 0]
-        if has_scale:
-            for p in parts:
-                p.vertices = p.vertices / scene_scale
-        if unit_correction != 1.0:
-            for p in parts:
-                p.vertices = p.vertices * unit_correction
-        if len(parts) <= 1:
-            return [merged_ref], merged_ref, False
-        concat2 = _trimesh.util.concatenate(parts)
-        bbox_match2 = np.allclose(ref_bbox_now, concat2.bounds, atol=0.01)
-        logger.info(f"scene.dump() gave {len(parts)} parts, match_ref={bbox_match2}")
-        if not bbox_match2:
-            logger.warning("Still mismatched — falling back to single mesh")
-            return [merged_ref], merged_ref, False
 
     return parts, merged_ref, True
 
